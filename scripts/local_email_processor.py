@@ -135,28 +135,32 @@ class EmailProcessor:
             "사용 가능한 임베딩 배포를 찾을 수 없습니다. AZURE_OPENAI_DEPLOYMENT_EMB 환경 변수를 확인하세요."
         )
 
+    # ======================
+    # 텍스트 전처리 / 힌트
+    # ======================
     def _pre_extract_deadlines(self, text: str, max_items: int = 5) -> List[str]:
         """
         본문에서 한국어 기한 표현 후보를 뽑아 LLM에 힌트로 제공.
         """
         patterns = [
+            # '까지' 있는 유형
             r"\(\s*\d{1,2}/\d{1,2}(?:\([^)]*\))?\s*까지\s*\)",
             r"\d{1,2}/\d{1,2}(?:\([^)]*\))?\s*까지",
             r"\d{4}-\d{1,2}-\d{1,2}(?:\s*\d{1,2}:\d{2})?\s*까지",
             r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지",
-            r"(?:금일|오늘|내일)\s*(?:오전|오후)?\s*\d{1,2}시(?:\s*\d{1,2}분)?\s*까지",
+            r"(?:금일|오늘|내일|명일)\s*(?:오전|오후)?\s*\d{1,2}시(?:\s*\d{1,2}분)?\s*까지",
             r"(?:오전|오후)?\s*\d{1,2}시(?:\s*\d{1,2}분)?\s*까지",
-            r"(?:금일|오늘|내일)\s*까지",
-            # ▼ '까지' 없는 흔한 표현
+            r"(?:금일|오늘|내일|명일)\s*까지",
+            # '까지' 없는 흔한 마감/범위
             r"마감[:\s]*\d{1,2}/\d{1,2}(?:\([^)]*\))?",
-            r"\d{1,2}/\d{1,2}(?:\([^)]*\))?(?:\s*\d{1,2}:\d{2})?",
+            r"\b\d{1,2}/\d{1,2}\b(?:\s*\d{1,2}:\d{2})?",
             r"\d{4}-\d{1,2}-\d{1,2}",
             r"\d+\s*일\s*(?:후|뒤)",
             r"\b(?:EOD|EOW)\b",
             r"(업무\s*(?:종료|시간)\s*전)",
             r"\d{1,2}/\d{1,2}\s*~\s*\d{1,2}/\d{1,2}",
             r"\d{4}-\d{1,2}-\d{1,2}\s*~\s*\d{4}-\d{1,2}-\d{1,2}",
-            # ▼ 주/월 내
+            # 주/월 내
             r"(이번\s*주\s*내|주중|이번\s*달\s*내|월말\s*까지|분기\s*말\s*까지)",
         ]
         found = []
@@ -173,6 +177,9 @@ class EmailProcessor:
         text_blob = f"{email.get('subject','')}\n\n{email.get('body','')}".strip()
         return self._pre_extract_deadlines(text_blob, max_items=10)
 
+    def _collect_deadline_hints_from_text(self, text: str) -> List[str]:
+        return self._pre_extract_deadlines(text, max_items=10)
+
     def _find_context(self, text: str, snippet: str, width: int = 80) -> str:
         i = text.find(snippet)
         if i == -1:
@@ -181,35 +188,102 @@ class EmailProcessor:
         end = min(len(text), i + len(snippet) + width)
         return text[start:end]
 
+    # ======================
+    # 멘션/세그먼트 로직
+    # ======================
+    def _is_self_mention_text(self, mention_text: str, user_context: dict) -> bool:
+        """'@박지훈(백엔드개발팀)' 같은 멘션 문자열이 나인지 판별"""
+        name = (user_context.get("name") or "").strip()
+        email = (user_context.get("email") or "").strip().lower()
+        team = (user_context.get("team") or "").strip()
+
+        base = mention_text.lstrip("@").split("(", 1)[0].replace(" ", "").lower()
+        packed = mention_text.replace(" ", "").lower()
+
+        return any(
+            [
+                name and base == name.replace(" ", "").lower(),
+                name and packed.startswith("@" + name.replace(" ", "").lower()),
+                email and email in packed,
+                team and team.replace(" ", "").lower() in packed,
+            ]
+        )
+
+    def _get_self_mention_segments(
+        self,
+        text: str,
+        user_context: dict,
+        max_chars: int = 1500,
+        max_lines: int = 25,
+    ) -> List[Tuple[int, int, str]]:
+        """
+        내 멘션(또는 내가 포함된 멘션 클러스터) 직후부터 다음 멘션 직전까지만 '세그먼트'로 잘라 반환.
+        - 같은 줄에서 멘션이 연속 등장하고 간격 ≤ 80자면 같은 클러스터로 취급(공동지시).
+        - 세그먼트는 빈 줄(단락 경계)에서 한 번 더 잘라서 너무 길게 안 가져가도록 제한.
+        """
+        mention_re = r"@[A-Za-z가-힣0-9_.]+(?:\([^)]+\))?"
+        mentions = list(re.finditer(mention_re, text))
+        if not mentions:
+            return []  # 멘션 없으면 세그먼트 기반 추출 생략
+
+        CLUSTER_GAP = 80
+        segs: List[Tuple[int, int, str]] = []
+
+        i = 0
+        while i < len(mentions):
+            # i부터 클러스터 구성(같은 줄 & GAP 이하)
+            cluster = [mentions[i]]
+            j = i + 1
+            while j < len(mentions):
+                gap = text[mentions[j - 1].end() : mentions[j].start()]
+                if ("\n" not in gap) and (len(gap) <= CLUSTER_GAP):
+                    cluster.append(mentions[j])
+                    j += 1
+                else:
+                    break
+
+            # 내가 포함된 클러스터만 세그먼트 대상
+            if any(
+                self._is_self_mention_text(m.group(0), user_context) for m in cluster
+            ):
+                cluster_end = cluster[-1].end()
+                next_start = mentions[j].start() if j < len(mentions) else len(text)
+                seg_start = cluster_end
+                seg_end = next_start
+
+                seg = text[seg_start:seg_end]
+
+                # 단락 경계(빈 줄)에서 컷
+                m_blank = re.search(r"\n\s*\n", seg)
+                if m_blank:
+                    seg = seg[: m_blank.start()]
+
+                # 길이 제한
+                lines = seg.splitlines()
+                if len(lines) > max_lines:
+                    seg = "\n".join(lines[:max_lines])
+                if len(seg) > max_chars:
+                    seg = seg[:max_chars]
+
+                segs.append((seg_start, seg_start + len(seg), seg))
+
+            i = j
+
+        return segs
+
     def _is_due_for_user(self, text: str, cand: str, user_context: dict) -> bool:
         """
         '나'에게 유효한 마감(due_raw)인지 판별.
         규칙:
-        1) (기존) 내 멘션 ~ 다음 멘션 사이 구간에 cand가 있으면 내 것.
-        2) (신규) 여러 멘션이 한 줄/짧은 간격(같은 문장)으로 묶인 '클러스터' 직후에 cand가 나오면,
-            그 클러스터에 내가 포함되어 있으면 내 것으로 간주(공동 지시).
-        3) (보강) cand 직전 윈도우에서 마지막 멘션이 '나'라면 내 것.
-        4) 멘션이 전혀 없으면 이전의 완화 규칙으로 판단.
+        1) 내 멘션 ~ 다음 멘션 사이 구간에 cand가 있으면 내 것.
+        2) 여러 멘션이 한 줄/짧은 간격(같은 문장)으로 묶인 '클러스터' 직후 cand가 나오면,
+           그 클러스터에 내가 포함되어 있으면 내 것으로 간주(공동 지시).
+        3) cand 직전 윈도우에서 마지막 멘션이 '나'라면 내 것.
+        4) 멘션이 전혀 없으면 기존 완화 규칙.
         """
         name = (user_context.get("name") or "").strip()
         email = (user_context.get("email") or "").strip()
         team = (user_context.get("team") or "").strip()
-
-        def _norm(s: str) -> str:
-            return (s or "").replace(" ", "").lower()
-
-        def _is_self_mention_text(mention_text: str) -> bool:
-            # mention_text 예: "@박지훈(백엔드개발팀)"
-            base = mention_text.lstrip("@").split("(", 1)[0]
-            packed = _norm(mention_text)
-            return any(
-                [
-                    _norm(base) == _norm(name),
-                    name and packed.startswith("@" + _norm(name)),
-                    email and _norm(email) in packed,
-                    team and _norm(team) in packed,
-                ]
-            )
 
         cand_idx = text.find(cand)
         if cand_idx == -1:
@@ -219,7 +293,7 @@ class EmailProcessor:
         mention_re = r"@[A-Za-z가-힣0-9_.]+(?:\([^)]+\))?"
         mentions = list(re.finditer(mention_re, text))
 
-        # 멘션이 없으면: 이전 완화 규칙 유지
+        # 멘션이 없으면: 완화 규칙
         if not mentions:
             ctx = self._find_context(text, cand, width=80)
             return any(
@@ -235,7 +309,7 @@ class EmailProcessor:
 
         # 1) 기본: 내 멘션 ~ 다음 멘션 사이 구간
         for i, m in enumerate(mentions):
-            if _is_self_mention_text(m.group(0)):
+            if self._is_self_mention_text(m.group(0), user_context):
                 seg_start = m.end()
                 seg_end = (
                     mentions[i + 1].start() if i + 1 < len(mentions) else len(text)
@@ -244,10 +318,7 @@ class EmailProcessor:
                     return True
 
         # 2) 멘션 클러스터(같은 문장/짧은 간격) 직후 cand → 클러스터에 내가 포함되어 있으면 True
-        #    - 같은 줄(개행 없음) & 간격 ≤ 80자면 동일 클러스터로 간주
         CLUSTER_GAP = 80
-
-        # cand 바로 앞의 마지막 멘션 인덱스
         last_before_idx = -1
         for i, m in enumerate(mentions):
             if m.start() < cand_idx:
@@ -256,7 +327,6 @@ class EmailProcessor:
                 break
 
         if last_before_idx >= 0:
-            # 뒤로 모으며 같은 줄 & 짧은 간격인 멘션들을 하나의 클러스터로 묶기
             cluster = [mentions[last_before_idx]]
             j = last_before_idx - 1
             while j >= 0:
@@ -268,87 +338,52 @@ class EmailProcessor:
                 else:
                     break
 
-            # 클러스터 끝 ~ cand 사이에 다른 멘션이 끼지 않았는지 확인
             cluster_end = cluster[-1].end()
             has_mention_between = any(
                 m.start() >= cluster_end and m.start() < cand_idx for m in mentions
             )
             if not has_mention_between:
-                # 클러스터 내에 내가 포함되어 있으면 공동 지시로 간주
-                if any(_is_self_mention_text(m.group(0)) for m in cluster):
+                if any(
+                    self._is_self_mention_text(m.group(0), user_context)
+                    for m in cluster
+                ):
                     return True
 
-        # 3) cand 직전 윈도우(200자 또는 2줄)에서 "마지막 멘션 == 내 멘션"이면 True
+        # 3) cand 직전 윈도우(200자)에서 마지막 멘션이 나
         window_start = max(0, cand_idx - 200)
         ctx = text[window_start:cand_idx]
-        # 마지막 멘션 찾기
         last_any = None
         for m in re.finditer(mention_re, ctx):
             last_any = m
         if last_any:
-            if _is_self_mention_text(last_any.group(0)):
-                # 동일 줄 내 지시 표현이 붙어 있으면 더욱 강하게 참으로 본다
+            if self._is_self_mention_text(last_any.group(0), user_context):
                 tail = ctx[last_any.end() :]
                 if ("\n" not in tail) or re.search(
                     r"(까지|마감|부탁|요청|확인|완료)", tail
                 ):
                     return True
 
-        # 최종 실패 → 내 due 아님
         return False
 
-    def _sanitize_document_key(self, key: str) -> str:
-        """Azure Search 문서 키 정제"""
-
-        # Azure Search 키 규칙: 문자, 숫자, 언더스코어(_), 대시(-), 등호(=)만 허용
-        # 특수문자를 언더스코어로 변경
-        sanitized = re.sub(r"[^a-zA-Z0-9_\-=]", "_", key)
-
-        # 연속된 언더스코어 정리
-        sanitized = re.sub(r"_+", "_", sanitized)
-
-        # 시작/끝 언더스코어 제거
-        sanitized = sanitized.strip("_")
-
-        # 길이 제한 (Azure Search 키 최대 길이: 1024자)
-        if len(sanitized) > 1000:
-            # 해시를 사용하여 고유성 보장
-            hash_suffix = hashlib.md5(key.encode()).hexdigest()[:8]
-            sanitized = sanitized[:992] + "_" + hash_suffix
-
-        return sanitized
-
-    def load_email_data(self, file_path: str) -> List[Dict]:
-        """이메일 JSON 파일 로드"""
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            emails = data.get("values", [])
-            logging.info(f"📧 {len(emails)}개 이메일 로드 완료: {file_path}")
-            return emails
-
-        except Exception as e:
-            logging.error(f"❌ 이메일 데이터 로드 실패: {e}")
-            raise
-
+    # ======================
+    # HTML → TEXT 전환
+    # ======================
     def _html_to_text(self, html_str: str) -> str:
         if not html_str:
             return ""
-        # 아주 가벼운 변환(BeautifulSoup 없이)
-        text = re.sub(
-            r"(?is)<(script|style).*?>.*?</\1>", " ", html_str
-        )  # 스크립트/스타일 제거
+        text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html_str)
         text = re.sub(r"(?is)<br\s*/?>", "\n", text)
         text = re.sub(r"(?is)</p>", "\n", text)
         text = re.sub(r"(?is)</li>", "\n- ", text)
-        text = re.sub(r"(?is)<[^>]+>", " ", text)  # 태그 제거
+        text = re.sub(r"(?is)<[^>]+>", " ", text)
         text = html.unescape(text)
         text = re.sub(r"[ \t\u00A0]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
+    # ======================
+    # 이메일 표준화
+    # ======================
     def preprocess_email(self, email_data: Dict) -> Dict:
         """이메일 데이터 전처리 (안전한 처리)"""
 
@@ -362,21 +397,6 @@ class EmailProcessor:
             if isinstance(value, list):
                 return value
             return default_list or []
-
-        def _html_to_text(self, html_str: str) -> str:
-            if not html_str:
-                return ""
-            import html as _html
-
-            text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html_str)
-            text = re.sub(r"(?is)<br\s*/?>", "\n", text)
-            text = re.sub(r"(?is)</p>", "\n", text)
-            text = re.sub(r"(?is)</li>", "\n- ", text)
-            text = re.sub(r"(?is)<[^>]+>", " ", text)
-            text = _html.unescape(text)
-            text = re.sub(r"[ \t\u00A0]+", " ", text)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-            return text.strip()
 
         # 기본 정제
         body = safe_get("email_body")
@@ -399,37 +419,32 @@ class EmailProcessor:
 
         # 서명/광고 블록 제거 (간단한 휴리스틱)
         signature_patterns = [r"\n\n--\n.*", r"\n\n.*드림$", r"\n\n.*감사합니다\..*"]
-
         for pattern in signature_patterns:
             body = re.sub(pattern, "", body, flags=re.DOTALL | re.MULTILINE)
 
-        # 안전한 배열 처리
+        # 주소록 배열 정규화
         to_names = safe_get_list("to_names")
         to_addresses = safe_get_list("to_addresses")
         cc_names = safe_get_list("cc_names")
         cc_addresses = safe_get_list("cc_addresses")
 
-        # 길이 맞추기 (names와 addresses 배열 길이가 다를 수 있음)
         max_to_len = max(len(to_names), len(to_addresses))
         max_cc_len = max(len(cc_names), len(cc_addresses))
 
-        # to 리스트 정규화
         to_list = []
         for i in range(max_to_len):
             name = to_names[i] if i < len(to_names) else ""
             email = to_addresses[i] if i < len(to_addresses) else ""
-            if name or email:  # 적어도 하나는 있어야 함
+            if name or email:
                 to_list.append({"name": name, "email": email})
 
-        # cc 리스트 정규화
         cc_list = []
         for i in range(max_cc_len):
             name = cc_names[i] if i < len(cc_names) else ""
             email = cc_addresses[i] if i < len(cc_addresses) else ""
-            if name or email:  # 적어도 하나는 있어야 함
+            if name or email:
                 cc_list.append({"name": name, "email": email})
 
-        # threads 데이터 안전한 처리
         threads = email_data.get("threads", {})
         keywords = []
         if isinstance(threads, dict):
@@ -437,7 +452,6 @@ class EmailProcessor:
             if not isinstance(keywords, list):
                 keywords = []
 
-        # 표준화된 형태로 변환
         standardized = {
             "recordId": safe_get("recordId"),
             "emailId": safe_get("email_id"),
@@ -455,6 +469,9 @@ class EmailProcessor:
 
         return standardized
 
+    # ======================
+    # 정책 엔진
+    # ======================
     def analyze_with_policy_engine(self, email_data: Dict, user_context: Dict) -> Dict:
         """정책 엔진 분석 (안전한 처리)"""
 
@@ -464,7 +481,6 @@ class EmailProcessor:
         cc_emails = email_data.get("cc_addresses", [])
         body = email_data.get("email_body", "")
 
-        # None 체크 및 기본값 설정
         if not isinstance(to_emails, list):
             to_emails = []
         if not isinstance(cc_emails, list):
@@ -478,7 +494,6 @@ class EmailProcessor:
         user_email = user_context.get("email", "")
         user_team = user_context.get("team", "")
 
-        # 멘션 추출 (빈 문자열 체크)
         mentions = []
         if body:
             try:
@@ -488,7 +503,6 @@ class EmailProcessor:
                 logging.warning(f"멘션 추출 실패: {e}")
                 mentions = []
 
-        # 요청 키워드 감지
         request_keywords = [
             "부탁",
             "요청",
@@ -516,17 +530,13 @@ class EmailProcessor:
                 logging.warning(f"요청 키워드 감지 실패: {e}")
                 request_detected = False
 
-        # 기본 판정 요소 (안전한 비교)
         self_sent = bool(from_email and user_email and from_email == user_email)
         to_contains_self = bool(user_email and user_email in to_emails)
         cc_contains_self = bool(user_email and user_email in cc_emails)
 
-        # 정책 결정
         policy_decision = "none"
-
         try:
             if to_contains_self and request_detected:
-                # A: To에 포함 + 요청 표현
                 user_mentions = [
                     mention
                     for mention in mentions
@@ -536,19 +546,16 @@ class EmailProcessor:
                     not any(
                         mention for mention in mentions if mention != f"@{user_name}"
                     )
-                    or user_mentions
-                ):
+                ) or user_mentions:
                     policy_decision = "A"
             elif cc_contains_self and not to_contains_self:
-                # B: CC에만 포함
                 if any(
                     user_name and f"@{user_name}" in mention for mention in mentions
                 ):
                     policy_decision = "A"  # 명시적 지목이면 액션
                 else:
-                    policy_decision = "B"  # 비액션
+                    policy_decision = "B"
             elif self_sent and request_detected:
-                # C: 본인이 보낸 요청
                 policy_decision = "C"
             elif (
                 to_contains_self
@@ -556,7 +563,6 @@ class EmailProcessor:
                 and user_team in body
                 and request_detected
             ):
-                # D: 팀 단위 요청
                 policy_decision = "D"
         except Exception as e:
             logging.warning(f"정책 결정 중 오류: {e}")
@@ -571,294 +577,242 @@ class EmailProcessor:
             "request_detected": request_detected,
         }
 
+    # ======================
+    # 세그먼트 전용 LLM 프롬프트/검증
+    # ======================
+    def _build_action_prompt_for_segment(
+        self,
+        email_data: Dict,
+        policy_signals: Dict,
+        user_context: Dict,
+        segment_text: str,
+        deadline_hints: List[str],
+    ) -> Tuple[str, str]:
+        name = user_context["name"]
+        email = user_context["email"]
+        team = user_context["team"]
+
+        followup_hint = ""
+        if policy_signals.get("self_sent"):
+            # 🔸 내가 보낸 메일이라면 FOLLOW_UP 모드 강제
+            followup_hint = (
+                "\n- 이 메일은 내가 보낸 요청이므로 action.type은 반드시 FOLLOW_UP 입니다."
+                "\n- FOLLOW_UP에서는 '상대에게 요청한 핵심 작업'을 title로 12~20자로 요약하세요(예: \"로그 분석 결과 회신 요청\")."
+                "\n- assignee_candidates에는 내 주소가 아니라 '상대 수신자/팀'을 넣으세요."
+                "\n- due_raw는 세그먼트(또는 이 세그먼트 안에서 보이는 문장)에서 발견되는 기한 표현을 그대로 복사하세요(없으면 null)."
+            )
+
+        system_prompt = f"""
+    당신은 이메일에서 '수신자 {name}<{email}>' 또는 '{team}' 팀(그리고 {name}이 To에 포함)에
+    실제로 배정된 액션만 추출합니다. JSON 한 줄만 출력하세요(요약/설명/코드블록 금지).
+
+    규칙:
+    - 이 프롬프트는 '세그먼트' 텍스트만 제공합니다. 반드시 '세그먼트 범위 내'에서만 액션을 추출하세요.
+    - '배정됨' = (내 이메일 To) 또는 (@{name} 멘션/내가 포함된 멘션 클러스터) 또는 (팀단위 지시 + To에 내가 포함).
+    - title: 12~20자, 동사+명사(예: "API 로그 분석").
+    - due_raw: 원문 그대로 복사(예: "금일 오후 2시까지"). 세그먼트 밖은 절대 보지 마세요.
+    - 값이 없으면 null.{followup_hint}
+
+    - JSON 스키마:
+    {{"is_action":true/false,"policy_decision":"A|B|C|D|none",
+    "action":{{"type":"DO|FOLLOW_UP|NONE","title":"", "assignee_candidates":["이름 <이메일>","팀명"],"due_raw":null,"priority":"High|Medium|Low","tags":["태그1","태그2"],"rationale":""}}}}
+    """.strip()
+
+        user_prompt = f"""
+    [세그먼트 전용 본문]
+    {segment_text[:3000]}
+
+    [세그먼트 내 기한 후보 힌트]: {deadline_hints}
+
+    정책 신호:
+    - 정책 결정: {policy_signals['policy_decision']}
+    - 본인 발송: {policy_signals['self_sent']}
+    - To에 본인 포함: {policy_signals['to_contains_self']}
+    - 멘션: {policy_signals['mentions']}
+    - 요청 감지: {policy_signals['request_detected']}
+
+    주의: 오직 JSON 한 줄만 출력하세요.
+    """.strip()
+
+        return system_prompt, user_prompt
+
+    def _validate_and_fix_action(
+        self,
+        result: Dict,
+        context_text: str,
+        hints: List[str],
+        policy_signals: Dict,
+        user_context: Dict,
+    ) -> Dict:
+        if not isinstance(result, dict):
+            return {"is_action": False, "policy_decision": "none", "action": None}
+
+        is_action = bool(result.get("is_action"))
+        policy = result.get("policy_decision") or policy_signals.get(
+            "policy_decision", "none"
+        )
+        action = result.get("action") or {}
+
+        a_type = (action.get("type") or "NONE").upper()
+        if a_type not in {"DO", "FOLLOW_UP", "NONE"}:
+            a_type = "NONE"
+
+        # 🔸 내가 보낸 메일이면 무조건 FOLLOW_UP로 교정
+        if policy_signals.get("self_sent"):
+            a_type = "FOLLOW_UP"
+            is_action = True
+
+        title = (action.get("title") or "").strip()
+        if len(title) > 20:
+            title = title[:20].rstrip()
+
+        priority = action.get("priority") or "Medium"
+        tags = action.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [str(tags)]
+        tags = list(dict.fromkeys([str(t) for t in tags]))
+
+        assignees = action.get("assignee_candidates") or []
+
+        due_raw = (action.get("due_raw") or "").strip() or None
+        # 🔸 FOLLOW_UP은 내 due 맥락 검증에서 제외(요청 상대의 기한일 수 있음)
+        if due_raw and a_type != "FOLLOW_UP":
+            if not self._is_due_for_user(context_text, due_raw, user_context):
+                logging.info(
+                    "🚫 타인 지시 맥락으로 due_raw 무효화(세그먼트 검증): %s", due_raw
+                )
+                due_raw = None
+
+        if a_type == "NONE":
+            is_action = False
+            action_out = None
+        else:
+            action_out = {
+                "type": a_type,
+                "title": title,
+                "assignee_candidates": assignees,
+                "due_raw": due_raw,
+                "priority": priority,
+                "tags": tags,
+                "rationale": action.get("rationale", ""),
+            }
+
+        return {"is_action": is_action, "policy_decision": policy, "action": action_out}
+
+    # ======================
+    # LLM 추출 (세그먼트 기반)
+    # ======================
     def extract_actions_with_llm(
         self, email_data: Dict, policy_signals: Dict, user_context: Dict
     ) -> Dict:
-        """LLM을 사용한 액션 추출"""
+        """
+        1) 본문에서 내 멘션/클러스터 기반 '세그먼트'를 자름
+        2) 각 세그먼트에 대해 LLM JSON 추출
+        3) 첫 유효 액션 반환(없으면 전체 본문으로 1회 폴백)
+        """
+        full_subject = email_data.get("subject", "")
+        full_body = email_data.get("body", "")
+        text_blob_full = f"{full_subject}\n\n{full_body}"
 
-        schema_block = """
-        다음 JSON 형식으로만, 한 줄의 유효한 JSON으로 응답하세요:
-        {
-        "is_action": true,
-        "policy_decision": "A|B|C|D|none",
-        "action": {
-            "type": "DO|FOLLOW_UP|NONE",
-            "title": "액션 제목(20자 이내)",
-            "assignee_candidates": ["이름 <이메일>", "팀명"],
-            "due_raw": "원본 기한 표현(힌트에서 고르거나 본문에서 그대로 발췌; 없으면 null)",
-            "priority": "High|Medium|Low",
-            "tags": ["태그1", "태그2"],
-            "rationale": "판단 근거(1~2문장)"
-        }
-        }
-        주의:
-        - 무조건 JSON만 출력(코드블록, 설명 금지)
-        - 값이 없으면 null 로 채워라
-        - due_raw 는 반드시 '원문 표현'을 그대로 복사
-        """.strip()
+        segments = self._get_self_mention_segments(full_body, user_context)
+        tried_any = False
 
-        system_prompt = f"""
-            당신은 이메일에서 액션 아이템을 추출하는 전문가입니다.
-
-            다음 정책 규칙을 반드시 준수하세요:
-            - A: To에 포함 + 요청 표현 → DO 액션
-            - B: CC에만 포함 + 명시적 지목 없음 → 비액션
-            - C: 본인이 보낸 요청 → FOLLOW_UP 액션
-            - D: 팀 단위 요청 + To에 포함 → DO 액션
-
-            사용자 정보:
-            - 이름: {user_context['name']}
-            - 이메일: {user_context['email']}
-            - 팀: {user_context['team']}
-
-            JSON 형식으로만 응답하세요.
-            """.strip()
-
-        deadline_hints = self._collect_deadline_hints(email_data)
-
-        user_prompt = f"""
-            이메일 분석:
-
-            제목: {email_data['subject']}
-            발신자: {email_data['from']['name']} <{email_data['from']['email']}>
-            수신자: {', '.join([f"{p['name']} <{p['email']}>" for p in email_data['to']])}
-            참조: {', '.join([f"{p['name']} <{p['email']}>" for p in email_data['cc']])}
-            날짜: {email_data['receivedAt']}
-
-            본문:
-            {email_data['body'][:3000]}
-
-            [기한 후보 힌트] 본문에서 규칙 기반으로 미리 탐지된 표현들:
-            {deadline_hints}
-
-            정책 신호:
-            - 정책 결정: {policy_signals['policy_decision']}
-            - 본인 발송: {policy_signals['self_sent']}
-            - To에 본인 포함: {policy_signals['to_contains_self']}
-            - 멘션: {policy_signals['mentions']}
-            - 요청 감지: {policy_signals['request_detected']}
-            - title은 12~20자 한국어 문장으로, 나에게 할당된 핵심 작업을 동사+명사로 요약(예: "API 서버 로그 분석").
-            - [기한 후보 힌트]가 비어 있어도, 본문/제목에서 직접 날짜·요일·시간·범위를 찾아 due_raw에 '원문 그대로' 복사해라. 정말 원문에 아무 표현도 없을 때만 null을 사용한다.
-
-            {schema_block}
-            """.strip()
-
-        try:
-            logging.info("=== 📤 LLM 요청 (system) ===\n%s", system_prompt)
-            logging.info("=== 📤 LLM 요청 (user) ===\n%s", user_prompt)
-
-            response = self.openai_client.chat.completions.create(
-                model=self.azure_openai_deployment_chat,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=800,
+        def _postfix(result: Dict, seg_text: str, hints: List[str]) -> Dict:
+            return self._validate_and_fix_action(
+                result,
+                f"{full_subject}\n\n{seg_text}",
+                hints,
+                policy_signals,
+                user_context,
             )
 
-            response_text = response.choices[0].message.content.strip()
-            logging.info("=== 📥 LLM 원본 응답 ===\n%s", response_text)
-
-            result = json.loads(response_text)
-
-            text_blob = f"{email_data.get('subject','')}\n\n{email_data.get('body','')}"
-            action = result.get("action") or {}
-            due_raw = (action.get("due_raw") or "").strip()
-
-            # '나'에게 할당된 기한인지 확인
-            if (
-                due_raw
-                and not result.get("type") == "FOLLOW_UP"
-                and not self._is_due_for_user(text_blob, due_raw, user_context)
-            ):
-                logging.info("🚫 타인 지시 맥락으로 due_raw 무효화: %s", due_raw)
-                action["due_raw"] = None
-                result["action"] = action
-
-            logging.info("✅ LLM 액션 추출 완료: %s", result.get("is_action", False))
-            return result
-
-        except json.JSONDecodeError as e:
-            logging.error("❌ JSON 파싱 실패: %s", e)
-            logging.error(
-                "LLM 원본 응답:\n%s",
-                response_text if "response_text" in locals() else "N/A",
+        # 1) 세그먼트별 시도
+        for idx, (_, _, seg_text) in enumerate(segments):
+            tried_any = True
+            hints = self._collect_deadline_hints_from_text(seg_text)
+            sys_p, usr_p = self._build_action_prompt_for_segment(
+                email_data, policy_signals, user_context, seg_text, hints
             )
-            return {"is_action": False, "policy_decision": "none", "action": None}
-        except Exception as e:
-            logging.exception("❌ LLM 추출 실패")
-            return {"is_action": False, "policy_decision": "none", "action": None}
 
-    def normalize_action(self, raw_action: Dict, email_data: Dict) -> Optional[Dict]:
-        """액션 데이터 정규화 (규칙→LLM 보정으로 due 해석, KST/UTC 동시 제공)"""
-
-        if not raw_action.get("is_action") or not raw_action.get("action"):
-            return None
-
-        action = raw_action["action"]
-        due_raw = (action.get("due_raw") or "").strip()
-
-        # 담당자 결정
-        assignee = "미지정"
-        for cand in action.get("assignee_candidates") or []:
-            if "@" in cand:
-                assignee = cand
-                break
-
-        # 기본 신뢰도
-        confidence = self.default_confidence
-
-        # 0) LLM 단계에서 이미 넣어둔 해석값이 있으면 우선 사용
-        due_iso = action.get("due_resolved_iso")
-        due_kst_str = action.get("due_resolved_kst")
-
-        # 1) 없으면 규칙 기반(+LLM 보정 fallback)으로 해석
-        if not due_iso and due_raw:
-            rkst, risco = self._resolve_relative_deadline(
-                due_raw, email_data.get("receivedAt")
-            )
-            if risco:
-                due_iso = risco
-                due_kst_str = rkst
-                action["due_resolved_iso"] = risco
-                action["due_resolved_kst"] = rkst
-
-        # 2) 여전히 없으면(아주 예외) 기존 파싱 백업
-        if not due_iso and due_raw:
             try:
-                kst = ZoneInfo("Asia/Seoul")
-                now_kst = datetime.now(kst)
-                hour = 18
-                minute = 0
-                t = re.search(r"(오전|오후)?\s*(\d{1,2})시(?:\s*(\d{1,2})분)?", due_raw)
-                if t:
-                    ampm, hh, mm = t.groups()
-                    hour = int(hh)
-                    minute = int(mm) if mm else 0
-                    if ampm == "오후" and hour < 12:
-                        hour += 12
-                    if ampm == "오전" and hour == 12:
-                        hour = 0
+                logging.info(
+                    "=== 📤 LLM 요청 (segment #%d system) ===\n%s", idx + 1, sys_p
+                )
+                logging.info(
+                    "=== 📤 LLM 요청 (segment #%d user) ===\n%s", idx + 1, usr_p
+                )
 
-                target_date = None
-                if re.search(r"(금일|오늘)", due_raw):
-                    target_date = now_kst.date()
-                elif "내일" in due_raw or "명일" in due_raw:
-                    target_date = (now_kst + timedelta(days=1)).date()
-                elif re.search(
-                    r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지", due_raw
-                ):
-                    wd_map = {
-                        "월": 0,
-                        "화": 1,
-                        "수": 2,
-                        "목": 3,
-                        "금": 4,
-                        "토": 5,
-                        "일": 6,
-                    }
-                    wd = re.search(
-                        r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)", due_raw
-                    ).group(1)
-                    delta = (wd_map[wd] - now_kst.weekday()) % 7
-                    target_date = (now_kst + timedelta(days=delta)).date()
-                elif re.search(r"\d{4}-\d{1,2}-\d{1,2}", due_raw):
-                    y, m, d = map(
-                        int, re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", due_raw).groups()
-                    )
-                    target_date = datetime(y, m, d, tzinfo=kst).date()
-                elif re.search(r"\b\d{1,2}/\d{1,2}\b", due_raw):
-                    m, d = map(
-                        int, re.search(r"\b(\d{1,2})/(\d{1,2})\b", due_raw).groups()
-                    )
-                    y = now_kst.year if m >= now_kst.month else now_kst.year + 1
-                    target_date = datetime(y, m, d, tzinfo=kst).date()
-                elif re.search(r"\d+\s*일\s*(?:후|뒤)", due_raw):
-                    days = int(re.search(r"(\d+)\s*일\s*(?:후|뒤)", due_raw).group(1))
-                    target_date = (now_kst + timedelta(days=days)).date()
+                resp = self.openai_client.chat.completions.create(
+                    model=self.azure_openai_deployment_chat,
+                    messages=[
+                        {"role": "system", "content": sys_p},
+                        {"role": "user", "content": usr_p},
+                    ],
+                    temperature=0.1,
+                    max_tokens=600,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                logging.info("=== 📥 LLM 응답 (segment #%d) ===\n%s", idx + 1, raw)
 
-                if not target_date:
-                    try:
-                        parsed = parser.parse(due_raw, fuzzy=True)
-                        parsed = (
-                            parsed.astimezone(kst)
-                            if parsed.tzinfo
-                            else parsed.replace(tzinfo=kst)
-                        )
-                        target_date = parsed.date()
-                        hour = parsed.hour or hour
-                        minute = parsed.minute or minute
-                    except Exception:
-                        pass
+                # JSON만 추출
+                m = re.search(r"\{.*\}\s*$", raw, flags=re.DOTALL)
+                if m:
+                    raw = m.group(0)
+                result = json.loads(raw)
 
-                if target_date:
-                    due_kst = datetime.combine(
-                        target_date, dt_time(hour, minute, tzinfo=kst)
-                    )
-                    due_iso = due_kst.astimezone(timezone.utc).isoformat()
-                    due_kst_str = due_kst.strftime("%Y-%m-%d %H:%M KST")
-                    action.setdefault("due_resolved_kst", due_kst_str)
-                    action.setdefault("due_resolved_iso", due_iso)
+                result = _postfix(result, seg_text, hints)
+                if result.get("is_action") and result.get("action"):
+                    logging.info("✅ 세그먼트 #%d 에서 액션 확정", idx + 1)
+                    return result
+
             except Exception as e:
-                logging.error(f"날짜/시간 정규화 오류: {e}, due_raw: {due_raw}")
-                due_iso = None
+                logging.warning("세그먼트 #%d 처리 실패: %s", idx + 1, e)
 
-        # 신뢰도 보정
-        if action.get("type") == "DO" and due_iso and "@" in assignee:
-            confidence = min(confidence + 0.2, 1.0)
-        elif action.get("type") == "FOLLOW_UP" and due_iso:
-            confidence = min(confidence + 0.15, 1.0)
+        # 2) 세그먼트가 없거나 다 실패 → 전체 본문으로 마지막 1회 시도
+        if not tried_any:
+            deadline_hints = self._collect_deadline_hints(email_data)
+            sys_p, usr_p = self._build_action_prompt_for_segment(
+                email_data, policy_signals, user_context, full_body, deadline_hints
+            )
+            try:
+                logging.info("=== 📤 LLM 요청 (fallback system) ===\n%s", sys_p)
+                logging.info("=== 📤 LLM 요청 (fallback user) ===\n%s", usr_p)
+                resp = self.openai_client.chat.completions.create(
+                    model=self.azure_openai_deployment_chat,
+                    messages=[
+                        {"role": "system", "content": sys_p},
+                        {"role": "user", "content": usr_p},
+                    ],
+                    temperature=0.1,
+                    max_tokens=600,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                logging.info("=== 📥 LLM 응답 (fallback) ===\n%s", raw)
+                m = re.search(r"\{.*\}\s*$", raw, flags=re.DOTALL)
+                if m:
+                    raw = m.group(0)
+                result = json.loads(raw)
+                result = self._validate_and_fix_action(
+                    result, text_blob_full, deadline_hints, policy_signals, user_context
+                )
+                logging.info(
+                    "✅ LLM 액션 추출 완료: %s", result.get("is_action", False)
+                )
+                return result
+            except Exception as e:
+                logging.exception("❌ LLM 추출 실패(폴백)")
+                return {"is_action": False, "policy_decision": "none", "action": None}
 
-        # 노트
-        note_parts = []
-        if due_raw:
-            note_parts.append(f"원본 기한: {due_raw}")
-        if due_kst_str:
-            note_parts.append(f"해석(KST): {due_kst_str}")
-
+        # 세그먼트는 있었지만 모두 비액션/실패
         return {
-            "title": action.get("title", ""),
-            "assignee": assignee,
-            "due": due_iso,
-            "priority": action.get("priority", "Medium"),
-            "tags": action.get("tags", []),
-            "type": action.get("type", "DO"),
-            "confidence": confidence,
-            "notes": " | ".join(note_parts) if note_parts else "",
+            "is_action": False,
+            "policy_decision": policy_signals.get("policy_decision", "none"),
+            "action": None,
         }
 
-    def create_text_chunks(
-        self, text: str, chunk_size: int = 900, overlap: int = 150
-    ) -> List[str]:
-        """텍스트 청킹"""
-
-        if len(text) <= chunk_size:
-            return [text]
-
-        chunks = []
-        start = 0
-
-        while start < len(text):
-            end = start + chunk_size
-
-            # 문장 경계에서 자르기 시도
-            if end < len(text):
-                last_period = text.rfind(".", start, end)
-                last_newline = text.rfind("\n", start, end)
-
-                boundary = max(last_period, last_newline)
-                if boundary > start + chunk_size // 2:
-                    end = boundary + 1
-
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-
-            start = end - overlap
-
-        return chunks
-
+    # ======================
+    # 마감 해석(KST/UTC) + LLM 보정
+    # ======================
     def _llm_resolve_deadline(
         self, due_raw: str, received_at_iso: Optional[str]
     ) -> Tuple[Optional[str], Optional[str]]:
@@ -984,7 +938,6 @@ class EmailProcessor:
             )
             if m:
                 wd = m.group(1)
-                # 다음 주 월요일
                 delta_to_monday = (0 - now_kst.weekday()) % 7
                 next_monday = (
                     now_kst + timedelta(days=delta_to_monday)
@@ -1049,6 +1002,219 @@ class EmailProcessor:
         resolved_kst_str = due_kst.strftime("%Y-%m-%d %H:%M KST")
         return resolved_kst_str, due_utc_iso
 
+    # ======================
+    # 액션 정규화
+    # ======================
+    def normalize_action(self, raw_action: Dict, email_data: Dict) -> Optional[Dict]:
+        """액션 데이터 정규화 (규칙→LLM 보정으로 due 해석, KST/UTC 동시 제공)"""
+
+        if not raw_action.get("is_action") or not raw_action.get("action"):
+            return None
+
+        action = raw_action["action"]
+        due_raw = (action.get("due_raw") or "").strip()
+
+        # ----------------------
+        # 담당자 결정 (FOLLOW_UP 보강)
+        # ----------------------
+        def _fmt_person(p: Dict[str, str]) -> Optional[str]:
+            nm = (p.get("name") or "").strip()
+            em = (p.get("email") or "").strip()
+            if nm and em:
+                return f"{nm} <{em}>"
+            return em or (nm if nm else None)
+
+        assignee: Optional[str] = None
+
+        # 1) LLM 후보 중 이메일(@)이 있는 것을 우선 선택
+        for cand in (action.get("assignee_candidates") or []):
+            if cand and "@" in cand:
+                assignee = cand.strip()
+                break
+
+        # 2) FOLLOW_UP이면 To/CC에서 첫 대상(보낸이/비어있는 항목 제외)으로 지정
+        if not assignee and action.get("type") == "FOLLOW_UP":
+            sender_email = ((email_data.get("from") or {}).get("email") or "").strip()
+            # To 우선, 없으면 CC
+            for p in (email_data.get("to") or []):
+                s = _fmt_person(p)
+                if s and (sender_email not in s):
+                    assignee = s
+                    break
+            if not assignee:
+                for p in (email_data.get("cc") or []):
+                    s = _fmt_person(p)
+                    if s and (sender_email not in s):
+                        assignee = s
+                        break
+
+        # 3) 후보에 이메일이 없었지만 텍스트가 있으면 그걸 사용
+        if not assignee:
+            for cand in (action.get("assignee_candidates") or []):
+                if cand and cand.strip():
+                    assignee = cand.strip()
+                    break
+
+        if not assignee:
+            assignee = "미지정"
+
+        # ----------------------
+        # 기본 신뢰도
+        # ----------------------
+        confidence = self.default_confidence
+
+        # ----------------------
+        # 기한 해석
+        # ----------------------
+        # 0) LLM 단계에서 이미 넣어둔 해석값이 있으면 우선 사용
+        due_iso = action.get("due_resolved_iso")
+        due_kst_str = action.get("due_resolved_kst")
+
+        # 1) 없으면 규칙 기반(+LLM 보정 fallback)으로 해석
+        if not due_iso and due_raw:
+            rkst, risco = self._resolve_relative_deadline(
+                due_raw, email_data.get("receivedAt")
+            )
+            if risco:
+                due_iso = risco
+                due_kst_str = rkst
+                action["due_resolved_iso"] = risco
+                action["due_resolved_kst"] = rkst
+
+        # 2) 여전히 없으면(예외) 보수적 파싱 백업
+        if not due_iso and due_raw:
+            try:
+                kst = ZoneInfo("Asia/Seoul")
+                now_kst = datetime.now(kst)
+                hour = 18
+                minute = 0
+                t = re.search(r"(오전|오후)?\s*(\d{1,2})시(?:\s*(\d{1,2})분)?", due_raw)
+                if t:
+                    ampm, hh, mm = t.groups()
+                    hour = int(hh)
+                    minute = int(mm) if mm else 0
+                    if ampm == "오후" and hour < 12:
+                        hour += 12
+                    if ampm == "오전" and hour == 12:
+                        hour = 0
+
+                target_date = None
+                if re.search(r"(금일|오늘)", due_raw):
+                    target_date = now_kst.date()
+                elif "내일" in due_raw or "명일" in due_raw:
+                    target_date = (now_kst + timedelta(days=1)).date()
+                elif re.search(
+                    r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지", due_raw
+                ):
+                    wd_map = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+                    wd = re.search(
+                        r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)", due_raw
+                    ).group(1)
+                    delta = (wd_map[wd] - now_kst.weekday()) % 7
+                    target_date = (now_kst + timedelta(days=delta)).date()
+                elif re.search(r"\d{4}-\d{1,2}-\d{1,2}", due_raw):
+                    y, m, d = map(
+                        int, re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", due_raw).groups()
+                    )
+                    target_date = datetime(y, m, d, tzinfo=kst).date()
+                elif re.search(r"\b\d{1,2}/\d{1,2}\b", due_raw):
+                    m, d = map(
+                        int, re.search(r"\b(\d{1,2})/(\d{1,2})\b", due_raw).groups()
+                    )
+                    y = now_kst.year if m >= now_kst.month else now_kst.year + 1
+                    target_date = datetime(y, m, d, tzinfo=kst).date()
+                elif re.search(r"\d+\s*일\s*(?:후|뒤)", due_raw):
+                    days = int(re.search(r"(\d+)\s*일\s*(?:후|뒤)", due_raw).group(1))
+                    target_date = (now_kst + timedelta(days=days)).date()
+
+                if not target_date:
+                    try:
+                        parsed = parser.parse(due_raw, fuzzy=True)
+                        parsed = (
+                            parsed.astimezone(kst)
+                            if parsed.tzinfo
+                            else parsed.replace(tzinfo=kst)
+                        )
+                        target_date = parsed.date()
+                        hour = parsed.hour or hour
+                        minute = parsed.minute or minute
+                    except Exception:
+                        pass
+
+                if target_date:
+                    due_kst = datetime.combine(
+                        target_date, dt_time(hour, minute, tzinfo=kst)
+                    )
+                    due_iso = due_kst.astimezone(timezone.utc).isoformat()
+                    due_kst_str = due_kst.strftime("%Y-%m-%d %H:%M KST")
+                    action.setdefault("due_resolved_kst", due_kst_str)
+                    action.setdefault("due_resolved_iso", due_iso)
+            except Exception as e:
+                logging.error(f"날짜/시간 정규화 오류: {e}, due_raw: {due_raw}")
+                due_iso = None
+
+        # ----------------------
+        # 신뢰도 보정
+        # ----------------------
+        if action.get("type") == "DO" and due_iso and "@" in assignee:
+            confidence = min(confidence + 0.2, 1.0)
+        elif action.get("type") == "FOLLOW_UP" and due_iso:
+            confidence = min(confidence + 0.15, 1.0)
+
+        # ----------------------
+        # 노트
+        # ----------------------
+        note_parts = []
+        if due_raw:
+            note_parts.append(f"원본 기한: {due_raw}")
+        if due_kst_str:
+            note_parts.append(f"해석(KST): {due_kst_str}")
+
+        return {
+            "title": action.get("title", ""),
+            "assignee": assignee,
+            "due": due_iso,  # UTC ISO
+            "priority": action.get("priority", "Medium"),
+            "tags": action.get("tags", []),
+            "type": action.get("type", "DO"),
+            "confidence": confidence,
+            "notes": " | ".join(note_parts) if note_parts else "",
+        }
+
+    # ======================
+    # 청킹/임베딩/업로드
+    # ======================
+    def create_text_chunks(
+        self, text: str, chunk_size: int = 900, overlap: int = 150
+    ) -> List[str]:
+        """텍스트 청킹"""
+
+        if len(text) <= chunk_size:
+            return [text]
+
+        chunks = []
+        start = 0
+
+        while start < len(text):
+            end = start + chunk_size
+
+            # 문장 경계에서 자르기 시도
+            if end < len(text):
+                last_period = text.rfind(".", start, end)
+                last_newline = text.rfind("\n", start, end)
+
+                boundary = max(last_period, last_newline)
+                if boundary > start + chunk_size // 2:
+                    end = boundary + 1
+
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+
+            start = end - overlap
+
+        return chunks
+
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """텍스트 임베딩 생성"""
 
@@ -1110,12 +1276,12 @@ class EmailProcessor:
 
             # 액션 데이터가 있으면 추가
             if action_data:
-                # action_data['due']가 ISO(UTC)일 수도(None일 수도) 있으니 그대로 사용
                 document.update(
                     {
+                        "action": action_data.get("title", ""),
                         "action_type": action_data.get("type", ""),
                         "assignee": action_data.get("assignee", ""),
-                        "due": action_data.get("due"),  # 더 이상 T00:00:00Z 붙이지 않음
+                        "due": action_data.get("due"),  # UTC ISO or None
                         "priority": action_data.get("priority", ""),
                         "tags": action_data.get("tags", []),
                         "confidence": action_data.get("confidence", 0.0),
@@ -1133,6 +1299,16 @@ class EmailProcessor:
         except Exception as e:
             logging.error(f"❌ Search 인덱스 업로드 실패: {e}")
             raise
+
+    def _sanitize_document_key(self, key: str) -> str:
+        """Azure Search 문서 키 정제"""
+        sanitized = re.sub(r"[^a-zA-Z0-9_\-=]", "_", key)
+        sanitized = re.sub(r"_+", "_", sanitized)
+        sanitized = sanitized.strip("_")
+        if len(sanitized) > 1000:
+            hash_suffix = hashlib.md5(key.encode()).hexdigest()[:8]
+            sanitized = sanitized[:992] + "_" + hash_suffix
+        return sanitized
 
     def save_to_table_storage(self, action_data: Dict, email_data: Dict) -> None:
         """Actions 테이블에 저장"""
@@ -1153,7 +1329,7 @@ class EmailProcessor:
                 "subject": email_data["subject"],
                 "title": action_data.get("title", ""),
                 "assignee": action_data.get("assignee", ""),
-                "due": action_data.get("due", ""),
+                "due": action_data.get("due", ""),  # UTC ISO
                 "priority": action_data.get("priority", ""),
                 "type": action_data.get("type", ""),
                 "tags": ";".join(action_data.get("tags", [])),
@@ -1161,6 +1337,7 @@ class EmailProcessor:
                 "receivedAt": email_data["receivedAt"],
                 "conversationId": email_data.get("conversationId", ""),
                 "webLink": "",
+                "done": False,
             }
 
             actions_table.upsert_entity(entity)
@@ -1168,6 +1345,24 @@ class EmailProcessor:
 
         except Exception as e:
             logging.error(f"❌ Actions 테이블 저장 실패: {e}")
+
+    # ======================
+    # 파이프라인
+    # ======================
+    def load_email_data(self, file_path: str) -> List[Dict]:
+        """이메일 JSON 파일 로드"""
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            emails = data.get("values", [])
+            logging.info(f"📧 {len(emails)}개 이메일 로드 완료: {file_path}")
+            return emails
+
+        except Exception as e:
+            logging.error(f"❌ 이메일 데이터 로드 실패: {e}")
+            raise
 
     def process_emails(self, email_file_path: str) -> Dict:
         """이메일 배치 처리"""
@@ -1230,18 +1425,18 @@ class EmailProcessor:
                     "team": "백엔드개발팀",
                 }
 
-                # 3. 정책 엔진 적용
+                # 3. 정책 엔진 적용 (원본 바디 사용)
                 policy_signals = self.analyze_with_policy_engine(
                     email_data, user_context
                 )
                 logging.info(f"📋 정책 분석: {policy_signals['policy_decision']}")
 
-                # 4. LLM 액션 추출
+                # 4. LLM 액션 추출(세그먼트 기반)
                 action_result = self.extract_actions_with_llm(
                     standardized_email, policy_signals, user_context
                 )
 
-                # 5. 액션 정규화
+                # 5. 액션 정규화(마감 해석 KST/UTC)
                 normalized_action = None
                 if action_result.get("is_action"):
                     normalized_action = self.normalize_action(

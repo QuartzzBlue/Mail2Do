@@ -117,6 +117,13 @@ def create_email_search_index():
             facetable=True
         ),
         SearchableField(
+            name="action",
+            type=SearchFieldDataType.String,
+            filterable=True,
+            facetable=True,
+            searchable=True
+        ),
+        SearchableField(
             name="assignee",
             type=SearchFieldDataType.String,
             filterable=True,
