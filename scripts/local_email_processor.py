@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta, time as dt_time
 from dateutil import parser
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.data.tables import TableServiceClient
@@ -150,7 +150,7 @@ class EmailProcessor:
             # ▼ '까지' 없는 흔한 표현
             r"마감[:\s]*\d{1,2}/\d{1,2}(?:\([^)]*\))?",
             r"\d{1,2}/\d{1,2}(?:\([^)]*\))?(?:\s*\d{1,2}:\d{2})?",
-            r"\d{4}-\d{1,2}-\d{1,2}(?:\s*\d{1,2}:\d{2})?",
+            r"\d{4}-\d{1,2}-\d{1,2}",
             r"\d+\s*일\s*(?:후|뒤)",
             r"\b(?:EOD|EOW)\b",
             r"(업무\s*(?:종료|시간)\s*전)",
@@ -172,6 +172,130 @@ class EmailProcessor:
     def _collect_deadline_hints(self, email: Dict) -> List[str]:
         text_blob = f"{email.get('subject','')}\n\n{email.get('body','')}".strip()
         return self._pre_extract_deadlines(text_blob, max_items=10)
+
+    def _find_context(self, text: str, snippet: str, width: int = 80) -> str:
+        i = text.find(snippet)
+        if i == -1:
+            return ""
+        start = max(0, i - width)
+        end = min(len(text), i + len(snippet) + width)
+        return text[start:end]
+
+    def _is_due_for_user(self, text: str, cand: str, user_context: dict) -> bool:
+        """
+        '나'에게 유효한 마감(due_raw)인지 판별.
+        규칙:
+        1) (기존) 내 멘션 ~ 다음 멘션 사이 구간에 cand가 있으면 내 것.
+        2) (신규) 여러 멘션이 한 줄/짧은 간격(같은 문장)으로 묶인 '클러스터' 직후에 cand가 나오면,
+            그 클러스터에 내가 포함되어 있으면 내 것으로 간주(공동 지시).
+        3) (보강) cand 직전 윈도우에서 마지막 멘션이 '나'라면 내 것.
+        4) 멘션이 전혀 없으면 이전의 완화 규칙으로 판단.
+        """
+        name = (user_context.get("name") or "").strip()
+        email = (user_context.get("email") or "").strip()
+        team = (user_context.get("team") or "").strip()
+
+        def _norm(s: str) -> str:
+            return (s or "").replace(" ", "").lower()
+
+        def _is_self_mention_text(mention_text: str) -> bool:
+            # mention_text 예: "@박지훈(백엔드개발팀)"
+            base = mention_text.lstrip("@").split("(", 1)[0]
+            packed = _norm(mention_text)
+            return any(
+                [
+                    _norm(base) == _norm(name),
+                    name and packed.startswith("@" + _norm(name)),
+                    email and _norm(email) in packed,
+                    team and _norm(team) in packed,
+                ]
+            )
+
+        cand_idx = text.find(cand)
+        if cand_idx == -1:
+            return False
+
+        # 모든 멘션 수집
+        mention_re = r"@[A-Za-z가-힣0-9_.]+(?:\([^)]+\))?"
+        mentions = list(re.finditer(mention_re, text))
+
+        # 멘션이 없으면: 이전 완화 규칙 유지
+        if not mentions:
+            ctx = self._find_context(text, cand, width=80)
+            return any(
+                [
+                    name and (name in ctx),
+                    email and (email in ctx),
+                    team and (team in ctx),
+                    re.search(
+                        r"(아래\s*작업|다음\s*작업).*(까지|마감|부탁|요청|확인)", ctx
+                    ),
+                ]
+            )
+
+        # 1) 기본: 내 멘션 ~ 다음 멘션 사이 구간
+        for i, m in enumerate(mentions):
+            if _is_self_mention_text(m.group(0)):
+                seg_start = m.end()
+                seg_end = (
+                    mentions[i + 1].start() if i + 1 < len(mentions) else len(text)
+                )
+                if seg_start <= cand_idx < seg_end:
+                    return True
+
+        # 2) 멘션 클러스터(같은 문장/짧은 간격) 직후 cand → 클러스터에 내가 포함되어 있으면 True
+        #    - 같은 줄(개행 없음) & 간격 ≤ 80자면 동일 클러스터로 간주
+        CLUSTER_GAP = 80
+
+        # cand 바로 앞의 마지막 멘션 인덱스
+        last_before_idx = -1
+        for i, m in enumerate(mentions):
+            if m.start() < cand_idx:
+                last_before_idx = i
+            else:
+                break
+
+        if last_before_idx >= 0:
+            # 뒤로 모으며 같은 줄 & 짧은 간격인 멘션들을 하나의 클러스터로 묶기
+            cluster = [mentions[last_before_idx]]
+            j = last_before_idx - 1
+            while j >= 0:
+                prev = mentions[j]
+                gap_text = text[prev.end() : cluster[0].start()]
+                if ("\n" not in gap_text) and (len(gap_text) <= CLUSTER_GAP):
+                    cluster.insert(0, prev)
+                    j -= 1
+                else:
+                    break
+
+            # 클러스터 끝 ~ cand 사이에 다른 멘션이 끼지 않았는지 확인
+            cluster_end = cluster[-1].end()
+            has_mention_between = any(
+                m.start() >= cluster_end and m.start() < cand_idx for m in mentions
+            )
+            if not has_mention_between:
+                # 클러스터 내에 내가 포함되어 있으면 공동 지시로 간주
+                if any(_is_self_mention_text(m.group(0)) for m in cluster):
+                    return True
+
+        # 3) cand 직전 윈도우(200자 또는 2줄)에서 "마지막 멘션 == 내 멘션"이면 True
+        window_start = max(0, cand_idx - 200)
+        ctx = text[window_start:cand_idx]
+        # 마지막 멘션 찾기
+        last_any = None
+        for m in re.finditer(mention_re, ctx):
+            last_any = m
+        if last_any:
+            if _is_self_mention_text(last_any.group(0)):
+                # 동일 줄 내 지시 표현이 붙어 있으면 더욱 강하게 참으로 본다
+                tail = ctx[last_any.end() :]
+                if ("\n" not in tail) or re.search(
+                    r"(까지|마감|부탁|요청|확인|완료)", tail
+                ):
+                    return True
+
+        # 최종 실패 → 내 due 아님
+        return False
 
     def _sanitize_document_key(self, key: str) -> str:
         """Azure Search 문서 키 정제"""
@@ -515,7 +639,7 @@ class EmailProcessor:
             - 요청 감지: {policy_signals['request_detected']}
             - title은 12~20자 한국어 문장으로, 나에게 할당된 핵심 작업을 동사+명사로 요약(예: "API 서버 로그 분석").
             - [기한 후보 힌트]가 비어 있어도, 본문/제목에서 직접 날짜·요일·시간·범위를 찾아 due_raw에 '원문 그대로' 복사해라. 정말 원문에 아무 표현도 없을 때만 null을 사용한다.
-            
+
             {schema_block}
             """.strip()
 
@@ -537,6 +661,21 @@ class EmailProcessor:
             logging.info("=== 📥 LLM 원본 응답 ===\n%s", response_text)
 
             result = json.loads(response_text)
+
+            text_blob = f"{email_data.get('subject','')}\n\n{email_data.get('body','')}"
+            action = result.get("action") or {}
+            due_raw = (action.get("due_raw") or "").strip()
+
+            # '나'에게 할당된 기한인지 확인
+            if (
+                due_raw
+                and not result.get("type") == "FOLLOW_UP"
+                and not self._is_due_for_user(text_blob, due_raw, user_context)
+            ):
+                logging.info("🚫 타인 지시 맥락으로 due_raw 무효화: %s", due_raw)
+                action["due_raw"] = None
+                result["action"] = action
+
             logging.info("✅ LLM 액션 추출 완료: %s", result.get("is_action", False))
             return result
 
@@ -552,7 +691,7 @@ class EmailProcessor:
             return {"is_action": False, "policy_decision": "none", "action": None}
 
     def normalize_action(self, raw_action: Dict, email_data: Dict) -> Optional[Dict]:
-        """액션 데이터 정규화 (KST 기준 해석 → UTC ISO 저장, 시간/요일/상대일 지원)"""
+        """액션 데이터 정규화 (규칙→LLM 보정으로 due 해석, KST/UTC 동시 제공)"""
 
         if not raw_action.get("is_action") or not raw_action.get("action"):
             return None
@@ -570,14 +709,26 @@ class EmailProcessor:
         # 기본 신뢰도
         confidence = self.default_confidence
 
-        # === 날짜/시간 파싱 ===
-        due_iso = None
-        if due_raw:
+        # 0) LLM 단계에서 이미 넣어둔 해석값이 있으면 우선 사용
+        due_iso = action.get("due_resolved_iso")
+        due_kst_str = action.get("due_resolved_kst")
+
+        # 1) 없으면 규칙 기반(+LLM 보정 fallback)으로 해석
+        if not due_iso and due_raw:
+            rkst, risco = self._resolve_relative_deadline(
+                due_raw, email_data.get("receivedAt")
+            )
+            if risco:
+                due_iso = risco
+                due_kst_str = rkst
+                action["due_resolved_iso"] = risco
+                action["due_resolved_kst"] = rkst
+
+        # 2) 여전히 없으면(아주 예외) 기존 파싱 백업
+        if not due_iso and due_raw:
             try:
                 kst = ZoneInfo("Asia/Seoul")
                 now_kst = datetime.now(kst)
-
-                # 시간/분 추출
                 hour = 18
                 minute = 0
                 t = re.search(r"(오전|오후)?\s*(\d{1,2})시(?:\s*(\d{1,2})분)?", due_raw)
@@ -591,13 +742,10 @@ class EmailProcessor:
                         hour = 0
 
                 target_date = None
-
-                # 상대일
                 if re.search(r"(금일|오늘)", due_raw):
                     target_date = now_kst.date()
-                elif "내일" in due_raw:
+                elif "내일" in due_raw or "명일" in due_raw:
                     target_date = (now_kst + timedelta(days=1)).date()
-                # 이번주 요일까지
                 elif re.search(
                     r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지", due_raw
                 ):
@@ -615,30 +763,28 @@ class EmailProcessor:
                     ).group(1)
                     delta = (wd_map[wd] - now_kst.weekday()) % 7
                     target_date = (now_kst + timedelta(days=delta)).date()
-                # YYYY-MM-DD
                 elif re.search(r"\d{4}-\d{1,2}-\d{1,2}", due_raw):
                     y, m, d = map(
                         int, re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", due_raw).groups()
                     )
                     target_date = datetime(y, m, d, tzinfo=kst).date()
-                # MM/DD
-                elif re.search(r"\d{1,2}/\d{1,2}", due_raw):
-                    m, d = map(int, re.search(r"(\d{1,2})/(\d{1,2})", due_raw).groups())
+                elif re.search(r"\b\d{1,2}/\d{1,2}\b", due_raw):
+                    m, d = map(
+                        int, re.search(r"\b(\d{1,2})/(\d{1,2})\b", due_raw).groups()
+                    )
                     y = now_kst.year if m >= now_kst.month else now_kst.year + 1
                     target_date = datetime(y, m, d, tzinfo=kst).date()
-                # N일 후/뒤
                 elif re.search(r"\d+\s*일\s*(?:후|뒤)", due_raw):
                     days = int(re.search(r"(\d+)\s*일\s*(?:후|뒤)", due_raw).group(1))
                     target_date = (now_kst + timedelta(days=days)).date()
 
-                # 마지막 수단: dateutil
                 if not target_date:
                     try:
                         parsed = parser.parse(due_raw, fuzzy=True)
                         parsed = (
-                            parsed.replace(tzinfo=kst)
-                            if not parsed.tzinfo
-                            else parsed.astimezone(kst)
+                            parsed.astimezone(kst)
+                            if parsed.tzinfo
+                            else parsed.replace(tzinfo=kst)
                         )
                         target_date = parsed.date()
                         hour = parsed.hour or hour
@@ -651,6 +797,9 @@ class EmailProcessor:
                         target_date, dt_time(hour, minute, tzinfo=kst)
                     )
                     due_iso = due_kst.astimezone(timezone.utc).isoformat()
+                    due_kst_str = due_kst.strftime("%Y-%m-%d %H:%M KST")
+                    action.setdefault("due_resolved_kst", due_kst_str)
+                    action.setdefault("due_resolved_iso", due_iso)
             except Exception as e:
                 logging.error(f"날짜/시간 정규화 오류: {e}, due_raw: {due_raw}")
                 due_iso = None
@@ -661,15 +810,22 @@ class EmailProcessor:
         elif action.get("type") == "FOLLOW_UP" and due_iso:
             confidence = min(confidence + 0.15, 1.0)
 
+        # 노트
+        note_parts = []
+        if due_raw:
+            note_parts.append(f"원본 기한: {due_raw}")
+        if due_kst_str:
+            note_parts.append(f"해석(KST): {due_kst_str}")
+
         return {
             "title": action.get("title", ""),
             "assignee": assignee,
-            "due": due_iso,  # ISO(UTC) 문자열 또는 None
+            "due": due_iso,
             "priority": action.get("priority", "Medium"),
             "tags": action.get("tags", []),
             "type": action.get("type", "DO"),
             "confidence": confidence,
-            "notes": f"원본 기한: {due_raw}" if due_raw else "",
+            "notes": " | ".join(note_parts) if note_parts else "",
         }
 
     def create_text_chunks(
@@ -702,6 +858,196 @@ class EmailProcessor:
             start = end - overlap
 
         return chunks
+
+    def _llm_resolve_deadline(
+        self, due_raw: str, received_at_iso: Optional[str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        규칙 파싱이 안 될 때 LLM로 상대표현을 절대시간으로 보정.
+        반환: (resolved_kst_str "YYYY-MM-DD HH:MM KST", resolved_utc_iso) 또는 (None, None)
+        """
+        try:
+            kst = ZoneInfo("Asia/Seoul")
+            now_kst = None
+            if received_at_iso:
+                tmp = parser.parse(received_at_iso)
+                now_kst = tmp.astimezone(kst) if tmp.tzinfo else tmp.replace(tzinfo=kst)
+            if not now_kst:
+                now_kst = datetime.now(kst)
+
+            system_prompt = (
+                "너는 한국어 기한 표현을 KST 기준의 명확한 날짜/시간으로 변환하는 도우미야.\n"
+                '- 출력은 반드시 JSON 한 줄: {"kst":"YYYY-MM-DD HH:MM","iso":"YYYY-MM-DDTHH:MM:SSZ"}\n'
+                "- 시간이 없으면 18:00으로 가정.\n"
+                "- '금일/오늘'=수신일, '명일/내일'=+1, '모레'=+2.\n"
+                "- '이번 주 금요일'=수신일이 속한 주의 금요일.\n"
+                "- '다음 주/차주 화요일'=다음 주의 화요일.\n"
+                "- 불가능하면 두 값 모두 null."
+            )
+            user_prompt = (
+                f"원문: {due_raw}\n"
+                f"수신시각(KST): {now_kst.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "한 줄 JSON으로만 답해."
+            )
+
+            resp = self.openai_client.chat.completions.create(
+                model=self.azure_openai_deployment_chat,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=120,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            data = json.loads(raw)
+
+            kst_str = data.get("kst")
+            iso = data.get("iso")
+            if (
+                kst_str
+                and re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$", kst_str)
+                and iso
+                and iso.endswith("Z")
+            ):
+                return f"{kst_str} KST", iso
+        except Exception as e:
+            logging.info(f"LLM 기한 보정 실패: {e}")
+        return None, None
+
+    def _resolve_relative_deadline(
+        self, due_raw: str, received_at_iso: Optional[str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        상대/모호 표현(due_raw)을 KST/UTC로 해석.
+        우선 규칙으로 시도, 실패 시 _llm_resolve_deadline()으로 보정.
+        반환: (resolved_kst_str 'YYYY-MM-DD HH:MM KST', resolved_utc_iso)
+        """
+        if not due_raw:
+            return None, None
+
+        kst = ZoneInfo("Asia/Seoul")
+        # 기준시각: 수신시각이 있으면 그것, 없으면 now
+        try:
+            if received_at_iso:
+                base = parser.parse(received_at_iso)
+                now_kst = (
+                    base.astimezone(kst) if base.tzinfo else base.replace(tzinfo=kst)
+                )
+            else:
+                now_kst = datetime.now(kst)
+        except Exception:
+            now_kst = datetime.now(kst)
+
+        text = due_raw.strip()
+
+        # 기본 시간(미지정 시 18:00)
+        hour = 18
+        minute = 0
+
+        # 오전/오후 시:분
+        t = re.search(r"(오전|오후)?\s*(\d{1,2})시(?:\s*(\d{1,2})분)?", text)
+        if t:
+            ampm, hh, mm = t.groups()
+            hour = int(hh)
+            minute = int(mm) if mm else 0
+            if ampm == "오후" and hour < 12:
+                hour += 12
+            if ampm == "오전" and hour == 12:
+                hour = 0
+
+        wd_map = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+        target_date = None
+
+        # 오늘/금일/명일/내일/모레
+        if re.search(r"(금일|오늘)", text):
+            target_date = now_kst.date()
+        elif re.search(r"(명일|내일)", text):
+            target_date = (now_kst + timedelta(days=1)).date()
+        elif "모레" in text:
+            target_date = (now_kst + timedelta(days=2)).date()
+
+        # 이번 주 요일까지
+        if not target_date:
+            m = re.search(
+                r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지?", text
+            )
+            if m:
+                wd = m.group(1)
+                delta = (wd_map[wd] - now_kst.weekday()) % 7
+                target_date = (now_kst + timedelta(days=delta)).date()
+
+        # 다음 주/차주 요일까지
+        if not target_date:
+            m = re.search(
+                r"(?:다음\s*주|차주)\s*(월|화|수|목|금|토|일)요일?\s*까지?", text
+            )
+            if m:
+                wd = m.group(1)
+                # 다음 주 월요일
+                delta_to_monday = (0 - now_kst.weekday()) % 7
+                next_monday = (
+                    now_kst + timedelta(days=delta_to_monday)
+                ).date() + timedelta(days=7)
+                target_date = next_monday + timedelta(days=wd_map[wd])
+
+        # EOD/EOW
+        if not target_date:
+            if re.search(r"\bEOD\b", text, re.IGNORECASE):
+                target_date = now_kst.date()
+                hour, minute = 18, 0
+            elif re.search(r"\bEOW\b", text, re.IGNORECASE):
+                delta = (4 - now_kst.weekday()) % 7  # 금요일
+                target_date = (now_kst + timedelta(days=delta)).date()
+                hour, minute = 18, 0
+
+        # YYYY-MM-DD
+        if not target_date:
+            m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+            if m:
+                y, mo, d = map(int, m.groups())
+                target_date = datetime(y, mo, d, tzinfo=kst).date()
+
+        # MM/DD
+        if not target_date:
+            m = re.search(r"\b(\d{1,2})/(\d{1,2})\b", text)
+            if m:
+                mo, d = map(int, m.groups())
+                y = now_kst.year if mo >= now_kst.month else now_kst.year + 1
+                target_date = datetime(y, mo, d, tzinfo=kst).date()
+
+        # N일 후/뒤
+        if not target_date:
+            m = re.search(r"(\d+)\s*일\s*(?:후|뒤)", text)
+            if m:
+                days = int(m.group(1))
+                target_date = (now_kst + timedelta(days=days)).date()
+
+        # 마지막 수단: dateutil
+        if not target_date:
+            try:
+                parsed = parser.parse(text, fuzzy=True)
+                parsed = (
+                    parsed.astimezone(kst)
+                    if parsed.tzinfo
+                    else parsed.replace(tzinfo=kst)
+                )
+                target_date = parsed.date()
+                hour = parsed.hour or hour
+                minute = parsed.minute or minute
+            except Exception:
+                pass
+
+        # 규칙으로도 못 구하면 LLM 보정
+        if not target_date:
+            return self._llm_resolve_deadline(
+                due_raw=text, received_at_iso=received_at_iso
+            )
+
+        due_kst = datetime.combine(target_date, dt_time(hour, minute, tzinfo=kst))
+        due_utc_iso = due_kst.astimezone(timezone.utc).isoformat()
+        resolved_kst_str = due_kst.strftime("%Y-%m-%d %H:%M KST")
+        return resolved_kst_str, due_utc_iso
 
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """텍스트 임베딩 생성"""
@@ -903,7 +1249,7 @@ class EmailProcessor:
                     )
                     if normalized_action:
                         stats["actions_extracted"] += 1
-                        logging.info(f"⚡ 액션 추출: {normalized_action['title']}")
+                        logging.info(f"⚡ 최종 보정 완료: {normalized_action}")
 
                 # 6. Azure AI Search 업로드
                 self.upload_to_search(standardized_email, normalized_action)
