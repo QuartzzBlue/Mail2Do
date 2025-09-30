@@ -1413,6 +1413,8 @@ class EmailProcessor:
             "errors": [],
         }
 
+        processed_email_ids = set()
+
         # 각 이메일 처리
         for item in emails:
             try:
@@ -1434,6 +1436,16 @@ class EmailProcessor:
                         f"⚠️ data 필드가 딕셔너리가 아닌 레코드 건너뜀: {record_id}"
                     )
                     continue
+
+                # 이메일 ID 기반으로 중복 체크
+                email_id = email_data.get('email_id')
+                if email_id:
+                    if email_id in processed_email_ids:
+                        logging.warning(f"⚠️ 이미 처리된 이메일 건너뜀: {email_id}")
+                        continue
+                    processed_email_ids.add(email_id)
+                else:
+                    logging.warning(f"⚠️ email_id가 없는 레코드: {record_id}")
 
                 # 필수 필드 검증
                 required_fields = ["subject", "email_body", "from_address"]
@@ -1492,6 +1504,10 @@ class EmailProcessor:
                 error_msg = f"이메일 처리 실패: {record_id} - {e}"
                 logging.error(f"❌ {error_msg}")
                 stats["errors"].append(error_msg)
+
+        skipped_count = stats['total_emails'] - stats['processed_emails'] - len(stats['errors'])
+        if skipped_count > 0:
+            logging.info(f"⏭️ 중복으로 건너뛴 이메일: {skipped_count}개")
 
         # 처리 결과 요약
         logging.info("🎉 이메일 처리 완료!")
