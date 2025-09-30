@@ -616,6 +616,15 @@ class EmailProcessor:
         email = user_context["email"]
         team = user_context["team"]
 
+        policy_hint = """
+        [정책 코드 설명]
+        - A: 수신자인 나(또는 @내이름/내가 포함된 멘션 클러스터)에게 '직접 배정'된 업무. (is_action=true)
+        - B: 참조/공지(CC 등)로 '내게 직접 배정되지 않음'. @나 지목도 없음. (세그먼트 텍스트 내에 분명한 '내 배정' 근거가 없으면 is_action=false)
+        - C: 내가 보낸 메일에서 타인에게 요청 (is_action=true, action['type']="FOLLOW_UP")
+        - D: 팀 단위 지시(예: 백엔드개발팀)이고 내가 To에 포함되어 실제로 내 팀 일이 된 경우. (is_action=true)
+        - none: 정책 판단 불가 (세그먼트 텍스트 내에 분명한 '내 배정' 근거가 없으면 is_action=false)
+        """
+
         followup_hint = ""
         if policy_signals.get("self_sent"):
             # 🔸 내가 보낸 메일이라면 FOLLOW_UP 모드 강제
@@ -627,36 +636,38 @@ class EmailProcessor:
             )
 
         system_prompt = f"""
-    당신은 이메일에서 '수신자 {name}<{email}>' 또는 '{team}' 팀(그리고 {name}이 To에 포함)에
-    실제로 배정된 액션만 추출합니다. JSON 한 줄만 출력하세요(요약/설명/코드블록 금지).
+            당신은 이메일에서 '수신자 {name}<{email}>' 또는 '{team}' 팀(그리고 {name}이 To에 포함)에
+            실제로 배정된 액션만 추출합니다. JSON 한 줄만 출력하세요(요약/설명/코드블록 금지).
 
-    규칙:
-    - 이 프롬프트는 '세그먼트' 텍스트만 제공합니다. 반드시 '세그먼트 범위 내'에서만 액션을 추출하세요.
-    - '배정됨' = (내 이메일 To) 또는 (@{name} 멘션/내가 포함된 멘션 클러스터) 또는 (팀단위 지시 + To에 내가 포함).
-    - title: 12~20자, 동사+명사(예: "API 로그 분석").
-    - due_raw: 원문 그대로 복사(예: "금일 오후 2시까지"). 세그먼트 밖은 절대 보지 마세요.
-    - 값이 없으면 null.{followup_hint}
+            규칙:
+            - 이 프롬프트는 '세그먼트' 텍스트만 제공합니다. 반드시 '세그먼트 범위 내'에서만 액션을 추출하세요.
+            - '배정됨' = (내 이메일 To) 또는 (@{name} 멘션/내가 포함된 멘션 클러스터) 또는 (팀단위 지시 + To에 내가 포함).
+            - title: 12~20자, 동사+명사(예: "API 로그 분석").
+            - due_raw: 원문 그대로 복사(예: "금일 오후 2시까지"). 세그먼트 밖은 절대 보지 마세요.
+            - 값이 없으면 null.{followup_hint}
 
-    - JSON 스키마:
-    {{"is_action":true/false,"policy_decision":"A|B|C|D|none",
-    "action":{{"type":"DO|FOLLOW_UP|NONE","title":"", "assignee_candidates":["이름 <이메일>","팀명"],"due_raw":null,"priority":"High|Medium|Low","tags":["태그1","태그2"],"rationale":""}}}}
-    """.strip()
+            {policy_hint}
+
+            - JSON 스키마:
+            {{"is_action":true/false,"policy_decision":"A|B|C|D|none",
+            "action":{{"type":"DO|FOLLOW_UP|NONE","title":"", "assignee_candidates":["이름 <이메일>","팀명"],"due_raw":null,"priority":"High|Medium|Low","tags":["태그1","태그2"],"rationale":""}}}}
+            """.strip()
 
         user_prompt = f"""
-    [세그먼트 전용 본문]
-    {segment_text[:3000]}
+            [세그먼트 전용 본문]
+            {segment_text[:3000]}
 
-    [세그먼트 내 기한 후보 힌트]: {deadline_hints}
+            [세그먼트 내 기한 후보 힌트]: {deadline_hints}
 
-    정책 신호:
-    - 정책 결정: {policy_signals['policy_decision']}
-    - 본인 발송: {policy_signals['self_sent']}
-    - To에 본인 포함: {policy_signals['to_contains_self']}
-    - 멘션: {policy_signals['mentions']}
-    - 요청 감지: {policy_signals['request_detected']}
+            정책 신호:
+            - 정책 코드: {policy_signals['policy_decision']}
+            - 본인 발송: {policy_signals['self_sent']}
+            - To에 본인 포함: {policy_signals['to_contains_self']}
+            - 멘션: {policy_signals['mentions']}
+            - 요청 감지: {policy_signals['request_detected']}
 
-    주의: 오직 JSON 한 줄만 출력하세요.
-    """.strip()
+            주의: 오직 JSON 한 줄만 출력하세요.
+            """.strip()
 
         return system_prompt, user_prompt
 
@@ -1304,7 +1315,7 @@ class EmailProcessor:
                 "chunkEmbedding": embedding,
                 "webLink": "",
                 "html_body": email_data.get("html_body", ""),
-                "body": email_data["body"]
+                "body": email_data["body"],
             }
 
             # 액션 데이터가 있으면 추가
