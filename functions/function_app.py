@@ -3,14 +3,16 @@ import azure.functions as func
 import logging
 import json
 import os
+import re
 from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from azure.core.credentials import AzureKeyCredential
 from azure.data.tables import TableServiceClient
 from openai import AzureOpenAI
 
-app = func.FunctionApp()
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # 환경 변수 로드
 AI_SEARCH_ENDPOINT = os.getenv("AI_SEARCH_ENDPOINT")
@@ -41,75 +43,90 @@ openai_client = AzureOpenAI(
 )
 
 
-@app.route(route="email/{emailId}", methods=["GET"])
-def get_email_detail(req: func.HttpRequest) -> func.HttpResponse:
-    """이메일 상세 조회 API"""
+def escape_odata_string(value: str) -> str:
+    """OData 쿼리용 문자열 이스케이프"""
+    if not value:
+        return ""
+    return value.replace("'", "''")
 
+
+def get_action_done_status(action_id: str) -> bool:
+    """Table Storage에서 액션의 완료 상태 조회"""
     try:
-        email_id = req.route_params.get("emailId")
-
-        # 해당 이메일의 모든 청크 조회
-        results = search_client.search(
-            search_text="*",
-            filter=f"emailId eq '{email_id}'",
-            select=[
-                "emailId",
-                "subject",
-                "from_name",
-                "from_email",
-                "to_names",
-                "cc_names",
-                "receivedAt",
-                "html_body",
-                "webLink",
-                "chunk",
-            ],
-            top=50,
-        )
-
-        chunks = []
-        email_info = None
-
-        for result in results:
-            if not email_info:
-                email_info = {
-                    "emailId": result["emailId"],
-                    "subject": result["subject"],
-                    "from_name": result["from_name"],
-                    "from_email": result["from_email"],
-                    "to_names": result["to_names"],
-                    "cc_names": result["cc_names"],
-                    "receivedAt": result["receivedAt"],
-                    "html_body": result.get("html_body", ""),
-                    "webLink": result.get("webLink", ""),
-                }
-
-            chunks.append(result["chunk"])
-
-        if not email_info:
-            return func.HttpResponse(
-                json.dumps({"error": "이메일을 찾을 수 없습니다"}),
-                mimetype="application/json",
-                status_code=404,
-            )
-
-        # 전체 본문 재구성
-        email_info["full_body"] = "\\n\\n".join(chunks)
-
-        return func.HttpResponse(
-            json.dumps(email_info), mimetype="application/json", status_code=200
-        )
-
+        actions_table = table_service.get_table_client("Actions")
+        entity = actions_table.get_entity(partition_key="techcorp", row_key=action_id)
+        return entity.get("done", False)
     except Exception as e:
-        logging.error(f"이메일 상세 조회 실패: {e}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}), mimetype="application/json", status_code=500
-        )
+        logging.debug(f"액션 {action_id}의 done 상태 조회 실패: {e}")
+        return False
+
+
+def format_search_result(result: dict, include_captions: bool = False) -> dict:
+    """검색 결과를 프론트엔드 형식으로 가공하여 리턴"""
+
+    assignee_raw = result.get("assignee")  # 박지훈 <jihoon.park@techcorp.com>
+
+    # None 처리를 먼저
+    if not assignee_raw or assignee_raw == "미지정":
+        assignee_display = "미지정"
+        assignee_email = ""
+    elif "<" in assignee_raw and ">" in assignee_raw:
+
+        match = re.search(r"<([^>]+)>", assignee_raw)
+        if match:
+            assignee_email = match.group(1).strip()
+        else:
+            assignee_email = ""
+        assignee_display = assignee_raw.split("<")[0].strip()
+    else:
+        # 이메일만 있는 경우
+        assignee_display = assignee_raw
+        assignee_email = assignee_raw
+
+    # done 상태 조회
+    action_id = result.get("id", "")
+    done_status = get_action_done_status(action_id)
+
+    item = {
+        "id": action_id,
+        "emailId": result.get("emailId", ""),
+        "subject": result.get("subject", "제목 없음"),
+        "from_name": result.get("from_name", ""),
+        "to_names": result.get("to_names", []),
+        "receivedAt": result.get("receivedAt", ""),
+        "bodyPreview": result.get("bodyPreview", ""),
+        "action": result.get("action", ""),
+        "actionType": result.get("action_type", "DO"),
+        "assignee": assignee_display,  # 항상 문자열
+        "assignee_email": assignee_email,  # 항상 문자열 (빈 문자열 또는 이메일)
+        "assignee_raw": assignee_raw if assignee_raw else "",  # 항상 문자열
+        "due": result.get("due"),
+        "priority": result.get("priority", "Medium"),
+        "tags": result.get("tags", []),
+        "confidence": result.get("confidence", 0.0),
+        "done": done_status,
+        "score": result.get("@search.score", 0.0),
+    }
+
+    # 시맨틱 캡션 추가
+    if include_captions:
+        caps = result.get("@search.captions")
+        if caps:
+            captions = []
+            for caption in caps:
+                text = getattr(caption, "text", None) or caption.get("text", "")
+                highlights = getattr(caption, "highlights", None) or caption.get(
+                    "highlights", ""
+                )
+                captions.append({"text": text, "highlights": highlights})
+            item["captions"] = captions
+
+    return item
 
 
 @app.route(route="login", methods=["POST"])
 def user_login(req: func.HttpRequest) -> func.HttpResponse:
-    """사용자 로그인 API - Employees 테이블 조회"""
+    """사용자 로그인 API - Employees 테이블 조회하여 일치하는 메일이 있다면 로그인 처리 진행"""
 
     try:
         req_body = req.get_json()
@@ -192,162 +209,80 @@ def user_login(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-@app.route(route="users", methods=["GET"])
-def list_users(req: func.HttpRequest) -> func.HttpResponse:
-    """사용자 목록 조회 API (개발/테스트용)"""
-
+@app.route(route="dashboard", methods=["POST"])
+def get_dashboard_data(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    대시보드() 데이터 조회 API
+    """
     try:
-        # 쿼리 파라미터
-        team_filter = req.params.get("team", "")
-        limit = int(req.params.get("limit", "20"))
+        req_body = req.get_json()
+        user_email = req_body.get("user_email", "")
 
-        employees_table = table_service.get_table_client("Employees")
+        if not user_email:
+            return func.HttpResponse(
+                json.dumps({"error": "user_email이 필요합니다"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=400,
+            )
 
-        users = []
-        count = 0
+        results = search_client.search(search_text="*", filter=None, top=100)
 
-        for entity in employees_table.list_entities():
-            if count >= limit:
-                break
+        dashboard_items = []
 
-            # 팀 필터 적용
-            if team_filter and team_filter not in entity.get("team_name", ""):
-                continue
+        for result in results:
+            item = format_search_result(result, include_captions=False)
+            dashboard_items.append(item)
 
-            user_info = {
-                "name": entity.get("name", ""),
-                "email": entity.get("email", ""),
-                "team_name": entity.get("team_name", ""),
-            }
-
-            users.append(user_info)
-            count += 1
+        logging.info(f"대시보드 결과 수: {len(dashboard_items)})")
 
         return func.HttpResponse(
             json.dumps(
-                {"users": users, "total_count": count, "team_filter": team_filter}
+                {"items": dashboard_items, "count": len(dashboard_items)},
+                ensure_ascii=False,
             ),
             mimetype="application/json",
             status_code=200,
         )
 
     except Exception as e:
-        logging.error(f"사용자 목록 조회 실패: {e}")
+        logging.error(f"대시보드 조회 실패: {e}")
+        import traceback
+
+        logging.error(traceback.format_exc())
         return func.HttpResponse(
-            json.dumps({"error": str(e)}), mimetype="application/json", status_code=500
-        )
-
-
-@app.route(route="teams", methods=["GET"])
-def list_teams(req: func.HttpRequest) -> func.HttpResponse:
-    """팀 목록 조회 API"""
-
-    try:
-        teams_table = table_service.get_table_client("Teams")
-
-        teams = []
-
-        for entity in teams_table.list_entities():
-            team_info = {
-                "team_name": entity.get("team_name", ""),
-                "partition_key": entity.get("PartitionKey", ""),
-                "row_key": entity.get("RowKey", ""),
-            }
-            teams.append(team_info)
-
-        # 팀명으로 정렬
-        teams.sort(key=lambda x: x["team_name"])
-
-        return func.HttpResponse(
-            json.dumps({"teams": teams, "total_count": len(teams)}),
+            json.dumps({"error": str(e)}, ensure_ascii=False),
             mimetype="application/json",
-            status_code=200,
-        )
-
-    except Exception as e:
-        logging.error(f"팀 목록 조회 실패: {e}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}), mimetype="application/json", status_code=500
+            status_code=500,
         )
 
 
 @app.route(route="search", methods=["POST"])
 def search_emails(req: func.HttpRequest) -> func.HttpResponse:
-    """이메일 검색 API"""
-
+    """
+    이메일 검색 API
+    """
     try:
         req_body = req.get_json()
-        query = req_body.get("query", "")
+        query = req_body.get("query", "").strip()
         filters = req_body.get("filters", {})
         user_email = req_body.get("user_email", "")
 
-        logging.info(f"검색 요청: {query}, 사용자: {user_email}, 필터: {filters}")
-
-        # --- OData 문자열 이스케이프(따옴표 -> 두 개의 따옴표) ---
-        def escape_odata_str(s: str) -> str:
-            return (s or "").replace("'", "''")
-
-        # OData 필터 구성
-        filter_conditions = []
-
-        # 사용자별 필터 - assignee 필드에 이메일이 포함되어 있는지 검색
-        if filters.get("assign_filter") == "me":
-            safe_email = escape_odata_str(user_email)
-            # search.in 사용하여 부분 일치 검색
-            filter_conditions.append(
-                f"(search.ismatch('{safe_email}', 'assignee') or assignee eq '미지정')"
+        if not user_email:
+            return func.HttpResponse(
+                json.dumps({"error": "user_email이 필요합니다"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=400,
             )
-        elif filters.get("assign_filter") == "unassigned":
-            filter_conditions.append("assignee eq '미지정'")
-        # "all"인 경우 필터 추가하지 않음
 
-        # 액션 타입 필터
-        if filters.get("action_types"):
-            types = filters["action_types"]
-            if types:
-                type_conditions = " or ".join(
-                    [f"action_type eq '{escape_odata_str(t)}'" for t in types if t]
-                )
-                if type_conditions:
-                    filter_conditions.append(f"({type_conditions})")
-
-        # 우선순위 필터
-        if filters.get("priorities"):
-            priorities = filters["priorities"]
-            if priorities:
-                priority_conditions = " or ".join(
-                    [f"priority eq '{escape_odata_str(p)}'" for p in priorities if p]
-                )
-                if priority_conditions:
-                    filter_conditions.append(f"({priority_conditions})")
-
-        # 완료 상태 필터 (done 필드가 있다고 가정)
-        if filters.get("completion_filter") == "complete":
-            filter_conditions.append("done eq true")
-        elif filters.get("completion_filter") == "incomplete":
-            filter_conditions.append("done eq false")
-        # "all"인 경우 필터 추가하지 않음
-
-        # 날짜 범위 필터
-        if filters.get("no_due"):
-            # 기한 미지정 (due가 null인 경우는 OData에서 직접 필터링 불가, 결과 후처리 필요)
-            pass
-        else:
-            if filters.get("date_from"):
-                filter_conditions.append(f"due ge {filters['date_from']}T00:00:00Z")
-            if filters.get("date_to"):
-                filter_conditions.append(f"due le {filters['date_to']}T23:59:59Z")
-
-        odata_filter = " and ".join(filter_conditions) if filter_conditions else None
-
-        # 디버깅용 로그
-        logging.info(f"생성된 OData 필터: {odata_filter}")
+        logging.info(f"검색 요청 - 사용자: {user_email}, 쿼리: '{query}'")
 
         # 검색 실행
-        if query.strip():
-            # 임베딩 생성 (실패 시 시맨틱-only 폴백)
+        if query:
+            # 쿼리가 있는 경우: 벡터 + 시맨틱 검색
             vector_queries = None
+
             try:
+                # 임베딩 생성
                 embedding_response = openai_client.embeddings.create(
                     model=AZURE_OPENAI_DEPLOYMENT_EMB, input=[query]
                 )
@@ -356,13 +291,15 @@ def search_emails(req: func.HttpRequest) -> func.HttpResponse:
                 vector_queries = [
                     VectorizedQuery(
                         vector=query_embedding,
-                        k_nearest_neighbors=10,
+                        k_nearest_neighbors=20,
                         fields="chunkEmbedding",
                     )
                 ]
+                logging.info("벡터 검색 활성화")
             except Exception as emb_ex:
-                logging.warning(f"임베딩 생성 실패, 시맨틱 검색으로 폴백: {emb_ex}")
+                logging.warning(f"임베딩 생성 실패, 텍스트 검색으로 폴백: {emb_ex}")
 
+            # 검색 실행
             if vector_queries:
                 results = search_client.search(
                     search_text=query,
@@ -371,8 +308,7 @@ def search_emails(req: func.HttpRequest) -> func.HttpResponse:
                     semantic_configuration_name="semantic-config",
                     query_caption="extractive",
                     query_answer="extractive",
-                    filter=odata_filter,
-                    top=20,
+                    top=50,
                 )
             else:
                 results = search_client.search(
@@ -381,79 +317,32 @@ def search_emails(req: func.HttpRequest) -> func.HttpResponse:
                     semantic_configuration_name="semantic-config",
                     query_caption="extractive",
                     query_answer="extractive",
-                    filter=odata_filter,
-                    top=20,
+                    top=50,
                 )
         else:
-            # 필터링만 수행
             results = search_client.search(
                 search_text="*",
-                filter=odata_filter,
                 order_by=["receivedAt desc"],
-                top=50,
+                top=100,
             )
 
-        # 결과 포맷팅
+        # 클라이언트 측 필터링
         formatted_results = []
+
         for result in results:
-            # no_due 필터 처리 (결과 후처리)
-            if filters.get("no_due"):
-                if result.get("due"):  # due가 있으면 스킵
-                    continue
-
-            # assignee에서 이메일만 추출
-            assignee_raw = result.get("assignee", "미지정")
-            assignee_display = assignee_raw
-            assignee_email = ""
-
-            # "이름 <email>" 형식에서 이메일 추출
-            if "<" in assignee_raw and ">" in assignee_raw:
-                import re
-
-                match = re.search(r"<([^>]+)>", assignee_raw)
-                if match:
-                    assignee_email = match.group(1)
-                assignee_display = assignee_raw.split("<")[0].strip()
-
-            item = {
-                "id": result.get("id"),
-                "emailId": result.get("emailId"),
-                "subject": result.get("subject"),
-                "from_name": result.get("from_name"),
-                "to_names": result.get("to_names", []),
-                "receivedAt": result.get("receivedAt"),
-                "bodyPreview": result.get("bodyPreview"),
-                "action": result.get("action", ""),
-                "action_type": result.get("action_type", ""),
-                "assignee": assignee_display,
-                "assignee_email": assignee_email,
-                "due": result.get("due"),
-                "priority": result.get("priority", ""),
-                "tags": result.get("tags", []),
-                "confidence": result.get("confidence", 0.0),
-                "done": result.get("done", False),
-                "score": result.get("@search.score", 0.0),
-            }
-
-            # 시맨틱 캡션 추가
-            caps = result.get("@search.captions")
-            if caps:
-                captions = []
-                for caption in caps:
-                    text = getattr(caption, "text", None) or caption.get("text")
-                    highlights = getattr(caption, "highlights", None) or caption.get(
-                        "highlights"
-                    )
-                    captions.append({"text": text, "highlights": highlights})
-                item["captions"] = captions
-
+            item = format_search_result(result, include_captions=False)
             formatted_results.append(item)
 
-        logging.info(f"검색 결과 수: {len(formatted_results)}")
+        logging.info(f"검색 결과 수: {len(formatted_results)} (필터링 후)")
 
         return func.HttpResponse(
             json.dumps(
-                {"results": formatted_results, "total_count": len(formatted_results)},
+                {
+                    "results": formatted_results,
+                    "total_count": len(formatted_results),
+                    "query": query,
+                    "filters_applied": filters,
+                },
                 ensure_ascii=False,
             ),
             mimetype="application/json",
@@ -472,99 +361,44 @@ def search_emails(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-@app.route(route="dashboard", methods=["POST"])
-def get_dashboard_data(req: func.HttpRequest) -> func.HttpResponse:
-    """대시보드 데이터 API"""
-
+@app.route(route="action/{actionId}", methods=["PATCH"])
+def update_action_status(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    액션 완료 상태 업데이트
+    체크박스 클릭 시 호출
+    """
     try:
+        action_id = req.route_params.get("actionId")
         req_body = req.get_json()
-        user_email = req_body.get("user_email", "")
+        done = req_body.get("done", False)
 
-        # 기본 필터링 - assignee에 이메일이 포함되어 있는지 검색
-        def escape_odata_str(s: str) -> str:
-            return (s or "").replace("'", "''")
-
-        safe_email = escape_odata_str(user_email)
-
-        # search.ismatch를 사용하여 부분 일치 검색
-        base_filter = f"(search.ismatch('{safe_email}', 'assignee') or assignee eq '미지정') and action_type eq 'DO' and (priority eq 'High' or priority eq 'Medium')"
-
-        # 이번 주 필터 추가
-        from datetime import datetime, timedelta
-
-        today = datetime.now().date()
-        week_start = today - timedelta(days=today.weekday())
-        week_end = week_start + timedelta(days=6)
-
-        date_filter = (
-            f" and due ge {week_start}T00:00:00Z and due le {week_end}T23:59:59Z"
-        )
-        final_filter = base_filter + date_filter
-
-        logging.info(f"대시보드 필터: {final_filter}")
-
-        # 검색 실행
-        results = search_client.search(
-            search_text="*",
-            filter=final_filter,
-            order_by=["due asc"],
-            select=[
-                "id",
-                "emailId",
-                "subject",
-                "from_name",
-                "receivedAt",
-                "action_type",
-                "action",
-                "assignee",
-                "due",
-                "priority",
-                "tags",
-                "confidence",
-                "bodyPreview",
-                "done",
-            ],
-            top=20,
-        )
-
-        # 결과 포맷팅
-        dashboard_items = []
-        for result in results:
-            # assignee에서 이메일만 추출
-            assignee_raw = result.get("assignee", "미지정")
-            assignee_display = assignee_raw
-
-            if "<" in assignee_raw and ">" in assignee_raw:
-                assignee_display = assignee_raw.split("<")[0].strip()
-
-            dashboard_items.append(
-                {
-                    "id": result["id"],
-                    "emailId": result["emailId"],
-                    "subject": result["subject"],
-                    "from_name": result["from_name"],
-                    "receivedAt": result["receivedAt"],
-                    "bodyPreview": result["bodyPreview"],
-                    "action": result.get("action", ""),
-                    "action_type": result["action_type"],
-                    "assignee": assignee_display,
-                    "due": result.get("due"),
-                    "priority": result["priority"],
-                    "tags": result.get("tags", []),
-                    "confidence": result.get("confidence", 0.0),
-                    "done": result.get("done", False),
-                }
+        if not action_id:
+            return func.HttpResponse(
+                json.dumps({"error": "actionId가 필요합니다"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=400,
             )
 
-        logging.info(f"대시보드 결과 수: {len(dashboard_items)}")
+        logging.info(f"액션 상태 업데이트 요청 - ID: {action_id}, done: {done}")
+
+        # Table Storage 업데이트
+        actions_table = table_service.get_table_client("Actions")
+
+        entity = {
+            "PartitionKey": "techcorp",
+            "RowKey": action_id,
+            "done": done,
+            "updatedAt": datetime.utcnow().isoformat(),
+        }
+
+        # upsert: 없으면 생성, 있으면 업데이트
+        actions_table.upsert_entity(entity, mode="merge")
+
+        logging.info(f"액션 {action_id} 상태 업데이트 완료: done={done}")
 
         return func.HttpResponse(
             json.dumps(
-                {
-                    "items": dashboard_items,
-                    "filter_applied": final_filter,
-                    "count": len(dashboard_items),
-                },
+                {"success": True, "action_id": action_id, "done": done},
                 ensure_ascii=False,
             ),
             mimetype="application/json",
@@ -572,7 +406,74 @@ def get_dashboard_data(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        logging.error(f"대시보드 데이터 조회 실패: {e}")
+        logging.error(f"액션 상태 업데이트 실패: {e}")
+        import traceback
+
+        logging.error(traceback.format_exc())
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=500,
+        )
+
+
+@app.route(route="email/{emailId}", methods=["GET"])
+def get_email_detail(req: func.HttpRequest) -> func.HttpResponse:
+    """이메일 상세 정보 조회"""
+    try:
+        email_id = req.route_params.get("emailId")
+
+        if not email_id:
+            return func.HttpResponse(
+                json.dumps({"error": "emailId가 필요합니다"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=400,
+            )
+
+        logging.info(f"이메일 상세 조회 - ID: {email_id}")
+
+        # emailId로 검색
+        results = search_client.search(
+            search_text="*",
+            filter=f"emailId eq '{escape_odata_string(email_id)}'",
+            top=1,
+        )
+
+        result = None
+        for r in results:
+            result = r
+            break
+
+        if not result:
+            return func.HttpResponse(
+                json.dumps({"error": "이메일을 찾을 수 없습니다"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=404,
+            )
+
+        detail = {
+            "emailId": result.get("emailId"),
+            "subject": result.get("subject"),
+            "from_name": result.get("from_name"),
+            "from_email": result.get("from_email"),
+            "to_names": result.get("to_names", []),
+            "to_emails": result.get("to_emails", []),
+            "cc_names": result.get("cc_names", []),
+            "cc_emails": result.get("cc_emails", []),
+            "receivedAt": result.get("receivedAt"),
+            "full_body": result.get("body", ""),
+            "html_body": result.get("html_body", ""),
+            "bodyPreview": result.get("bodyPreview", ""),
+        }
+
+        return func.HttpResponse(
+            json.dumps(detail, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logging.error(f"이메일 상세 조회 실패: {e}")
         import traceback
 
         logging.error(traceback.format_exc())
