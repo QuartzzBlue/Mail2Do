@@ -188,7 +188,6 @@ class EmailProcessor:
         end = min(len(text), i + len(snippet) + width)
         return text[start:end]
 
-
     # ======================
     # 멘션/세그먼트 로직
     # ======================
@@ -1305,6 +1304,7 @@ class EmailProcessor:
                 "chunkEmbedding": embedding,
                 "webLink": "",
                 "html_body": email_data.get("html_body", ""),
+                "body": email_data["body"]
             }
 
             # 액션 데이터가 있으면 추가
@@ -1438,7 +1438,7 @@ class EmailProcessor:
                     continue
 
                 # 이메일 ID 기반으로 중복 체크
-                email_id = email_data.get('email_id')
+                email_id = email_data.get("email_id")
                 if email_id:
                     if email_id in processed_email_ids:
                         logging.warning(f"⚠️ 이미 처리된 이메일 건너뜀: {email_id}")
@@ -1505,7 +1505,9 @@ class EmailProcessor:
                 logging.error(f"❌ {error_msg}")
                 stats["errors"].append(error_msg)
 
-        skipped_count = stats['total_emails'] - stats['processed_emails'] - len(stats['errors'])
+        skipped_count = (
+            stats["total_emails"] - stats["processed_emails"] - len(stats["errors"])
+        )
         if skipped_count > 0:
             logging.info(f"⏭️ 중복으로 건너뛴 이메일: {skipped_count}개")
 
