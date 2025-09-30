@@ -188,24 +188,44 @@ class EmailProcessor:
         end = min(len(text), i + len(snippet) + width)
         return text[start:end]
 
+
     # ======================
     # 멘션/세그먼트 로직
     # ======================
     def _is_self_mention_text(self, mention_text: str, user_context: dict) -> bool:
-        """'@박지훈(백엔드개발팀)' 같은 멘션 문자열이 나인지 판별"""
+        """멘션 문자열이 나인지 판별"""
         name = (user_context.get("name") or "").strip()
         email = (user_context.get("email") or "").strip().lower()
         team = (user_context.get("team") or "").strip()
 
-        base = mention_text.lstrip("@").split("(", 1)[0].replace(" ", "").lower()
-        packed = mention_text.replace(" ", "").lower()
+        # 멘션 원문 정리
+        raw = mention_text.strip()
+        if not raw.startswith("@"):
+            return False
+
+        # '@' 제거, 괄호 내용 제거 → "@박지훈(백엔드개발팀)" -> "박지훈"
+        base = raw.lstrip("@").split("(", 1)[0]
+        base = base.replace(" ", "").lower()
+        # 존칭/불용어 제거
+        base = re.sub(r"(님|씨|님들)$", "", base)
+
+        packed = raw.replace(" ", "").lower()
+
+        # 이메일 로컬 파트도 비교 (ex. jihoon.park)
+        email_local = email.split("@")[0] if email else ""
 
         return any(
             [
-                name and base == name.replace(" ", "").lower(),
-                name and packed.startswith("@" + name.replace(" ", "").lower()),
-                email and email in packed,
-                team and team.replace(" ", "").lower() in packed,
+                # 정확 이름 매칭 (공백 제거, 대소문자 무시)
+                (name and base == name.replace(" ", "").lower()),
+                # '@박지훈...' 형태 시작 매칭
+                (name and packed.startswith("@" + name.replace(" ", "").lower())),
+                # 이메일 포함
+                (email and email in packed),
+                # 이메일 로컬 파트 매칭
+                (email_local and base == email_local),
+                # 팀명 포함 (@백엔드개발팀)
+                (team and team.replace(" ", "").lower() in packed),
             ]
         )
 
@@ -217,18 +237,20 @@ class EmailProcessor:
         max_lines: int = 25,
     ) -> List[Tuple[int, int, str]]:
         """
-        내 멘션(또는 내가 포함된 멘션 클러스터) 직후부터 다음 멘션 직전까지만 '세그먼트'로 잘라 반환.
+        내 멘션(또는 내가 포함된 멘션 클러스터)부터 다음 멘션 직전까지를 세그먼트로 반환.
         - 같은 줄에서 멘션이 연속 등장하고 간격 ≤ 80자면 같은 클러스터로 취급(공동지시).
-        - 세그먼트는 빈 줄(단락 경계)에서 한 번 더 잘라서 너무 길게 안 가져가도록 제한.
+        - 세그먼트 시작을 클러스터 시작에서 50자 앞(backoff)으로 당겨, 멘션 문맥이 LLM/검증 단계에 항상 추가되도록 보장.
+        - 빈 줄에서 추가 컷, 길이 제한 유지.
         """
-        mention_re = r"@[A-Za-z가-힣0-9_.]+(?:\([^)]+\))?"
+        mention_re = r"@[A-Za-z가-힣0-9_.\-]+(?:\([^)]+\))?"
         mentions = list(re.finditer(mention_re, text))
         if not mentions:
-            return []  # 멘션 없으면 세그먼트 기반 추출 생략
+            return []
 
         CLUSTER_GAP = 80
-        segs: List[Tuple[int, int, str]] = []
+        BACKOFF = 50  # 멘션 앞쪽 문맥 조금 포함
 
+        segs: List[Tuple[int, int, str]] = []
         i = 0
         while i < len(mentions):
             # i부터 클러스터 구성(같은 줄 & GAP 이하)
@@ -246,9 +268,12 @@ class EmailProcessor:
             if any(
                 self._is_self_mention_text(m.group(0), user_context) for m in cluster
             ):
+                cluster_start = cluster[0].start()
                 cluster_end = cluster[-1].end()
                 next_start = mentions[j].start() if j < len(mentions) else len(text)
-                seg_start = cluster_end
+
+                # 🔹 멘션을 포함시키고, 살짝 앞(backoff)까지 넣어준다
+                seg_start = max(0, cluster_start - BACKOFF)
                 seg_end = next_start
 
                 seg = text[seg_start:seg_end]
@@ -1027,7 +1052,7 @@ class EmailProcessor:
         assignee: Optional[str] = None
 
         # 1) LLM 후보 중 이메일(@)이 있는 것을 우선 선택
-        for cand in (action.get("assignee_candidates") or []):
+        for cand in action.get("assignee_candidates") or []:
             if cand and "@" in cand:
                 assignee = cand.strip()
                 break
@@ -1036,13 +1061,13 @@ class EmailProcessor:
         if not assignee and action.get("type") == "FOLLOW_UP":
             sender_email = ((email_data.get("from") or {}).get("email") or "").strip()
             # To 우선, 없으면 CC
-            for p in (email_data.get("to") or []):
+            for p in email_data.get("to") or []:
                 s = _fmt_person(p)
                 if s and (sender_email not in s):
                     assignee = s
                     break
             if not assignee:
-                for p in (email_data.get("cc") or []):
+                for p in email_data.get("cc") or []:
                     s = _fmt_person(p)
                     if s and (sender_email not in s):
                         assignee = s
@@ -1050,7 +1075,7 @@ class EmailProcessor:
 
         # 3) 후보에 이메일이 없었지만 텍스트가 있으면 그걸 사용
         if not assignee:
-            for cand in (action.get("assignee_candidates") or []):
+            for cand in action.get("assignee_candidates") or []:
                 if cand and cand.strip():
                     assignee = cand.strip()
                     break
@@ -1106,7 +1131,15 @@ class EmailProcessor:
                 elif re.search(
                     r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)요일?\s*까지", due_raw
                 ):
-                    wd_map = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+                    wd_map = {
+                        "월": 0,
+                        "화": 1,
+                        "수": 2,
+                        "목": 3,
+                        "금": 4,
+                        "토": 5,
+                        "일": 6,
+                    }
                     wd = re.search(
                         r"(?:이번\s*주|금주)\s*(월|화|수|목|금|토|일)", due_raw
                     ).group(1)
