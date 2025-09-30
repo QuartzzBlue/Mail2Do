@@ -331,9 +331,13 @@ def search_emails(req: func.HttpRequest) -> func.HttpResponse:
 
         for result in results:
             item = format_search_result(result, include_captions=False)
+            # 액션이 없는 이메일인 경우에는 검색 결과에서 제외
+            if not item["assignee"] or not item["action"]:
+                continue
+
             formatted_results.append(item)
 
-        logging.info(f"검색 결과 수: {len(formatted_results)} (필터링 후)")
+        logging.info(f"검색 결과 수: {len(formatted_results)}")
 
         return func.HttpResponse(
             json.dumps(
