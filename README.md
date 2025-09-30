@@ -199,7 +199,7 @@ def analyze_with_policy_engine(self, email_data: Dict, user_context: Dict) -> Di
     }
     """
 
-    # 멘션 여부 파악 -> 이후 멘션 기준으로 세그먼트(action 후보 구간) 추출
+    # 멘션 여부 파악 -> 이후 멘션 기준으로 세그먼트(action 후보 구간) 추출 (ex. @박개발팀장님, @이인증개발자(인증개발팀) @보안팀)
     mentions = []
     if body:
         try:
