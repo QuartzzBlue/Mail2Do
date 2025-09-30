@@ -426,15 +426,11 @@ def render_dashboard_page():
 
         st.markdown(f"### 🔍 검색 결과 ({len(filtered_results)}개)")
 
-        # 결과 정렬: 우선순위 > 마감일
+        # 정렬 -> 마감일
         if filtered_results:
-            priority_order = {"High": 0, "Medium": 1, "Low": 2}
             filtered_results = sorted(
                 filtered_results,
-                key=lambda x: (
-                    priority_order.get(x.get("priority", "Medium"), 1),
-                    x.get("due") or "9999-12-31",
-                ),
+                key=lambda x: (x.get("due") or "9999-12-31",),
             )
 
         render_email_results_with_checkbox(filtered_results, dashboard)
@@ -456,15 +452,11 @@ def render_dashboard_page():
             due_date_filter=due_date_filter,
         )
 
-        # 정렬: 우선순위 > 마감일
+        # 정렬 -> 마감일
         if filtered_items:
-            priority_order = {"High": 0, "Medium": 1, "Low": 2}
             filtered_items = sorted(
                 filtered_items,
-                key=lambda x: (
-                    priority_order.get(x.get("priority", "Medium"), 1),
-                    x.get("due") or "9999-12-31",
-                ),
+                key=lambda x: (x.get("due") or "9999-12-31",),
             )
 
         # 메트릭 표시 (필터링된 데이터 기준)
@@ -554,6 +546,7 @@ def render_email_results_with_checkbox(results: List[Dict], dashboard: EmailDash
         action_type = item.get("actionType", "DO")
         action_type_kr = "할 일" if action_type == "DO" else "추적"
         subject = item.get("subject", "No Subject")
+        action = item.get("action", "No Action")
 
         # 우선순위별 이모지
         priority_emoji = (
@@ -588,9 +581,9 @@ def render_email_results_with_checkbox(results: List[Dict], dashboard: EmailDash
             title_col1, title_col2 = st.columns([8, 2])
             with title_col1:
                 if is_done:
-                    st.markdown(f"~~**{subject}**~~")
+                    st.markdown(f"~~**{action}**~~")
                 else:
-                    st.markdown(f"**{subject}**")
+                    st.markdown(f"**{action}**")
             with title_col2:
                 badge_text = f"{priority_emoji} {priority}"
                 if is_done:
