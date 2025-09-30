@@ -18,7 +18,7 @@
 * [🧩 주요 기술 구성](#-주요-기술-구성)
 * [🗺️ 아키텍처 & 데이터 플로우](#️-아키텍처--데이터-플로우)
 * [🧠 기능 구현 주안점 & 핵심 로직](#-기능-구현-주안점--핵심-로직)
-* [🔨 TBD](#-tbd)
+* [🔨 TBD (추가 예정 기능)](#-tbd-추가-예정-기능)
 * [✨ 회고](#-회고)
 ---
 
@@ -34,6 +34,8 @@
 
 > 🌏 서비스 바로가기 (Azure App Services)    
 > https://webapp-slee-mail2do-dashboard.azurewebsites.net/ 
+
+<img src="_readme/mail2do.PNG">
 
 ---
 
@@ -144,8 +146,44 @@ Mail2DO/
 아래 코드는 인덱스 프로세서 핵심 로직입니다.    
 (실제 코드에서 길이를 줄여 가독성 위주로 발췌)
 
+#### 1) 이메일 데이터 전처리
+```python
+# ======================
+    # 이메일 표준화
+    # ======================
+    def preprocess_email(self, email_data: Dict) -> Dict:
+        """이메일 데이터 전처리"""
 
-##### 1) 정책 엔진(Policy Engine) — 메일 맥락에서 액션 신호 만들기
+        # 기본 정제
+        body = safe_get("email_body")
+        html_body = safe_get("html_body")
+
+        # 중복 줄 제거
+        if html_body:
+            html_text = self._html_to_text(html_body)
+            if html_text:
+                merged = (body + "\n\n" + html_text).strip() if body else html_text
+                # 중복 라인 간단 제거
+                lines = []
+                seen = set()
+                for ln in merged.splitlines():
+                    key = ln.strip()
+                    if key and key not in seen:
+                        lines.append(ln)
+                        seen.add(key)
+                body = "\n".join(lines)
+
+        # 서명/광고 블록 제거
+        signature_patterns = [r"\n\n--\n.*", r"\n\n.*드림$", r"\n\n.*감사합니다\..*"]
+        for pattern in signature_patterns:
+            body = re.sub(pattern, "", body, flags=re.DOTALL | re.MULTILINE)
+
+         # ... (상세 로직은 원본 코드 참조)
+         
+        return standardized
+```
+
+#### 2) 정책 엔진(Policy Engine) — 메일 맥락에서 액션 신호 만들기
 
 ````python
 def analyze_with_policy_engine(self, email_data: Dict, user_context: Dict) -> Dict:
@@ -502,10 +540,11 @@ def _resolve_relative_deadline(self, due_raw: str, received_at_iso: str | None) 
 
 ---
 
-## 🔨 TBD  (추가 예정 기능)
+## 🔨 TBD (추가 예정 기능)
 #### Azure Graph API(Outlook) 연동: 메일 직접 읽어오기 / 일별 데이터 수집/적재
 #### Azure Entra ID 연동: 조직 계정 기반 SSO 로그인 적용
 #### 임박 액션 알림 메일: 마감 임박 액션 아이템을 사용자에게 리마인더 메일 발송
+#### 메일 당 Action 이 두 개 이상 추출되는 케이스 보완 필요
 
 ---
 
