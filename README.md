@@ -37,6 +37,8 @@
 
 <img src="_readme/mail2do.PNG">
 
+<img src="_readme/mail2do_2.PNG">
+
 ---
 
 ## 📦 프로젝트 구조
