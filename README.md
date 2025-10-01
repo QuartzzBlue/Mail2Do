@@ -121,7 +121,7 @@ Mail2DO/
 4. **Azure Storage Table (Table/Blob)**
 
    * 액션 JSON: Table Storage(`Actions` / `Employees`)
-   * 원문 이메일/로그: Blob Storage
+   * 원문 이메일: Blob Storage
 
 5. **API 계층 (Azure Functions)**
 
